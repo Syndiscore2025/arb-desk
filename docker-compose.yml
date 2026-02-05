@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16
@@ -20,8 +18,14 @@ services:
     environment:
       SERVICE_NAME: odds_ingest
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ARB_MATH_URL: http://arb_math:8000
+      DECISION_GATEWAY_URL: http://decision_gateway:8000
+      SLACK_NOTIFIER_URL: http://slack_notifier:8000
     depends_on:
       - postgres
+      - arb_math
+      - decision_gateway
+      - slack_notifier
     ports:
       - "8001:8000"
 

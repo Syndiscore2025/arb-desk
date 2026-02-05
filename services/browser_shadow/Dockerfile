@@ -27,7 +27,7 @@ RUN apt-get update \
 
 COPY services/browser_shadow/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-    && playwright install --with-deps chromium
+    && playwright install chromium
 
 COPY shared /app/shared
 COPY services/browser_shadow /app/services/browser_shadow

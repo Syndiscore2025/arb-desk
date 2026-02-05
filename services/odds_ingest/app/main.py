@@ -46,7 +46,7 @@ def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
         with httpx.Client(timeout=10.0) as client:
             arb_response = client.post(
                 f"{ARB_MATH_URL}/arbitrage",
-                json=arb_request.model_dump(),
+                json=arb_request.model_dump(mode="json"),
             )
             arb_response.raise_for_status()
             arb_data = arb_response.json()
@@ -65,7 +65,7 @@ def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
             with httpx.Client(timeout=10.0) as client:
                 decision_response = client.post(
                     f"{DECISION_GATEWAY_URL}/decision",
-                    json=DecisionRequest(opportunity=opp, context={}).model_dump(),
+                    json=DecisionRequest(opportunity=opp, context={}).model_dump(mode="json"),
                 )
                 decision_response.raise_for_status()
                 decision_data = decision_response.json()
@@ -90,7 +90,7 @@ def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
             with httpx.Client(timeout=10.0) as client:
                 client.post(
                     f"{SLACK_NOTIFIER_URL}/notify",
-                    json=SlackNotification(message=message).model_dump(),
+                    json=SlackNotification(message=message).model_dump(mode="json"),
                 )
         except Exception:
             pass
