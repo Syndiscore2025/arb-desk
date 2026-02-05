@@ -136,6 +136,10 @@ BOOKMAKER_CREDENTIALS={"fanduel":{"username":"you@email.com","password":"yourpas
 
 # Feed configs (see .env.example for full format)
 FEED_CONFIGS=[{"bookmaker":"fanduel","enabled":true,...}]
+
+# Logging (optional - defaults shown)
+LOG_LEVEL=INFO
+LOG_FORMAT=json
 ```
 
 ---
@@ -237,6 +241,7 @@ sudo certbot --nginx -d your-domain.com
 
 ### View Logs
 
+**Docker Compose Logs (stdout):**
 ```bash
 # All services
 docker compose logs -f
@@ -246,6 +251,41 @@ docker compose logs -f market_feed
 
 # Last 100 lines
 docker compose logs --tail 100 market_feed
+```
+
+**Structured Log Files (JSON):**
+```bash
+# View market_feed logs
+docker compose exec market_feed cat /var/log/arb-desk/market_feed.log | tail -50
+
+# View browser-specific logs
+docker compose exec market_feed cat /var/log/arb-desk/browser.log | tail -50
+
+# Parse JSON logs with jq
+docker compose exec market_feed cat /var/log/arb-desk/market_feed.log | jq -r 'select(.level=="ERROR")'
+```
+
+**Via HTTP API (market_feed:8006):**
+```bash
+# Recent logs
+curl http://localhost:8006/logs?lines=50
+
+# Browser logs only
+curl http://localhost:8006/logs/browser
+
+# Errors only
+curl http://localhost:8006/logs/errors
+
+# Log summary/statistics
+curl http://localhost:8006/logs/summary
+```
+
+**Via Slack:**
+```
+arb logs              # Recent logs
+arb logs errors       # Only errors
+arb logs browser      # Browser activity
+arb logs summary      # Statistics
 ```
 
 ### Restart Services
