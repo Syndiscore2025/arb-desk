@@ -378,20 +378,105 @@ async def handle_slack_events(request: Request) -> Dict:
         logger.info(f"Bet command result: {result}")
         return {"ok": True}
 
-    # Parse service control commands: "arb start|stop|restart|status [service]"
+    # Parse service control commands: "arb start|stop|restart|status|logs [service]"
     arb_match = re.match(
-        r"arb\s+(start|stop|restart|status|scrape)(?:\s+(\S+))?",
+        r"arb\s+(start|stop|restart|status|scrape|logs)(?:\s+(\S+))?",
         text,
         re.IGNORECASE,
     )
     if arb_match:
         action = arb_match.group(1).lower()
-        service = arb_match.group(2)
+        arg = arb_match.group(2)
 
-        result = await handle_service_control(action, service, user_id)
-        logger.info(f"Service control result: {result}")
+        if action == "logs":
+            result = await handle_logs_command(arg, user_id)
+        else:
+            result = await handle_service_control(action, arg, user_id)
+        logger.info(f"Command result: {result}")
 
     return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log Viewing Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def handle_logs_command(log_type: Optional[str], user_id: str) -> Dict:
+    """
+    Handle log viewing commands from Slack.
+
+    Usage:
+        arb logs           - Get recent logs (last 50 lines)
+        arb logs errors    - Get only ERROR/CRITICAL logs
+        arb logs browser   - Get browser-specific logs
+        arb logs summary   - Get log statistics summary
+    """
+    log_type = (log_type or "recent").lower()
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if log_type == "errors":
+                response = await client.get(f"{MARKET_FEED_URL}/logs/errors", params={"lines": 20})
+                title = "🔴 Recent Errors"
+            elif log_type == "browser":
+                response = await client.get(f"{MARKET_FEED_URL}/logs/browser", params={"lines": 30})
+                title = "🌐 Browser Logs"
+            elif log_type == "summary":
+                response = await client.get(f"{MARKET_FEED_URL}/logs/summary")
+                data = response.json()
+
+                # Format summary nicely
+                lines = ["📊 *Log Summary*", ""]
+                lines.append(f"*Total entries:* {data.get('total_entries', 0)}")
+                lines.append("")
+
+                # Level counts
+                lines.append("*By Level:*")
+                for level, count in data.get("level_counts", {}).items():
+                    if count > 0:
+                        lines.append(f"  • {level}: {count}")
+
+                # Bookmaker counts
+                if data.get("bookmaker_counts"):
+                    lines.append("")
+                    lines.append("*By Bookmaker:*")
+                    for bm, count in data.get("bookmaker_counts", {}).items():
+                        lines.append(f"  • {bm}: {count}")
+
+                # Recent errors
+                if data.get("recent_errors"):
+                    lines.append("")
+                    lines.append("*Recent Errors:*")
+                    for err in data.get("recent_errors", [])[:5]:
+                        lines.append(f"  ⚠️ [{err.get('bookmaker', 'unknown')}] {err.get('message', '')[:100]}")
+
+                msg = "\n".join(lines)
+                notify(SlackNotification(message=msg))
+                return {"success": True, "message": msg}
+            else:
+                # Default: recent logs
+                response = await client.get(f"{MARKET_FEED_URL}/logs", params={"lines": 30})
+                title = "📋 Recent Logs"
+
+            # Format log output
+            logs_text = response.text.strip()
+            if not logs_text or logs_text == "No logs available yet.":
+                msg = f"{title}\n\n_No logs available yet._"
+            else:
+                # Truncate if too long for Slack
+                if len(logs_text) > 2500:
+                    logs_text = logs_text[-2500:]
+                    logs_text = "...\n" + logs_text
+                msg = f"{title}\n```\n{logs_text}\n```"
+
+            notify(SlackNotification(message=msg))
+            return {"success": True, "message": msg}
+
+    except Exception as e:
+        msg = f"❌ Failed to fetch logs: {str(e)}"
+        notify(SlackNotification(message=msg))
+        return {"success": False, "message": msg}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

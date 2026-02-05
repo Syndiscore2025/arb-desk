@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -29,15 +30,13 @@ from shared.schemas import (
     ProxyConfig,
     ScrapeResult,
 )
+from shared.logging_config import setup_logging
 from .session_manager import session_manager
 from .bet_executor import BetExecutor
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = setup_logging("market_feed")
+browser_logger = logging.getLogger("market_feed.browser")
 
 # Environment configuration
 SERVICE_NAME = os.getenv("SERVICE_NAME", "market_feed")
@@ -351,3 +350,158 @@ async def place_bet(request: BetRequest) -> BetResponse:
               "Manual bet placement required.",
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log Viewing Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+from pathlib import Path
+from fastapi.responses import PlainTextResponse
+
+LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/arb-desk"))
+
+
+@app.get("/logs", response_class=PlainTextResponse)
+async def get_logs(
+    lines: int = 100,
+    level: Optional[str] = None,
+    bookmaker: Optional[str] = None,
+) -> str:
+    """
+    Get recent log entries.
+
+    Args:
+        lines: Number of lines to return (default 100)
+        level: Filter by log level (DEBUG, INFO, WARNING, ERROR)
+        bookmaker: Filter by bookmaker name
+    """
+    log_file = LOG_DIR / "market_feed.log"
+
+    if not log_file.exists():
+        return "No logs available yet."
+
+    try:
+        with open(log_file, "r") as f:
+            all_lines = f.readlines()
+
+        # Get last N lines
+        recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
+
+        # Filter if requested
+        if level or bookmaker:
+            filtered = []
+            for line in recent:
+                try:
+                    entry = json.loads(line)
+                    if level and entry.get("level") != level.upper():
+                        continue
+                    if bookmaker and entry.get("bookmaker") != bookmaker:
+                        continue
+                    filtered.append(line)
+                except json.JSONDecodeError:
+                    continue
+            recent = filtered
+
+        return "".join(recent)
+
+    except Exception as e:
+        return f"Error reading logs: {str(e)}"
+
+
+@app.get("/logs/browser", response_class=PlainTextResponse)
+async def get_browser_logs(lines: int = 100) -> str:
+    """Get browser-specific logs (navigation, scraping, errors)."""
+    log_file = LOG_DIR / "browser.log"
+
+    if not log_file.exists():
+        return "No browser logs available yet."
+
+    try:
+        with open(log_file, "r") as f:
+            all_lines = f.readlines()
+
+        recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        return "".join(recent)
+
+    except Exception as e:
+        return f"Error reading browser logs: {str(e)}"
+
+
+@app.get("/logs/errors", response_class=PlainTextResponse)
+async def get_error_logs(lines: int = 50) -> str:
+    """Get only ERROR and CRITICAL level logs."""
+    log_file = LOG_DIR / "market_feed.log"
+
+    if not log_file.exists():
+        return "No logs available yet."
+
+    try:
+        with open(log_file, "r") as f:
+            all_lines = f.readlines()
+
+        errors = []
+        for line in all_lines:
+            try:
+                entry = json.loads(line)
+                if entry.get("level") in ("ERROR", "CRITICAL"):
+                    errors.append(line)
+            except json.JSONDecodeError:
+                continue
+
+        recent = errors[-lines:] if len(errors) > lines else errors
+        return "".join(recent) if recent else "No errors found."
+
+    except Exception as e:
+        return f"Error reading logs: {str(e)}"
+
+
+@app.get("/logs/summary")
+async def get_log_summary() -> Dict:
+    """Get summary statistics of recent logs."""
+    log_file = LOG_DIR / "market_feed.log"
+
+    if not log_file.exists():
+        return {"error": "No logs available yet"}
+
+    try:
+        with open(log_file, "r") as f:
+            all_lines = f.readlines()
+
+        # Count by level
+        level_counts = {"DEBUG": 0, "INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+        bookmaker_counts: Dict[str, int] = {}
+        event_counts: Dict[str, int] = {}
+        recent_errors = []
+
+        for line in all_lines[-1000:]:  # Last 1000 entries
+            try:
+                entry = json.loads(line)
+                level = entry.get("level", "INFO")
+                level_counts[level] = level_counts.get(level, 0) + 1
+
+                if bm := entry.get("bookmaker"):
+                    bookmaker_counts[bm] = bookmaker_counts.get(bm, 0) + 1
+
+                if evt := entry.get("event_type"):
+                    event_counts[evt] = event_counts.get(evt, 0) + 1
+
+                if level in ("ERROR", "CRITICAL"):
+                    recent_errors.append({
+                        "timestamp": entry.get("timestamp"),
+                        "message": entry.get("message"),
+                        "bookmaker": entry.get("bookmaker"),
+                    })
+
+            except json.JSONDecodeError:
+                continue
+
+        return {
+            "total_entries": len(all_lines),
+            "level_counts": level_counts,
+            "bookmaker_counts": bookmaker_counts,
+            "event_counts": event_counts,
+            "recent_errors": recent_errors[-10:],  # Last 10 errors
+        }
+
+    except Exception as e:
+        return {"error": str(e)}

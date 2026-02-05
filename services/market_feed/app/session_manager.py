@@ -15,6 +15,7 @@ from .adapters.base import BaseFeedAdapter
 from .adapters.generic import GenericSportsbookAdapter
 
 logger = logging.getLogger(__name__)
+browser_logger = logging.getLogger("market_feed.browser.session")
 
 
 class SessionManager:
@@ -90,25 +91,72 @@ class SessionManager:
         """
         adapter = self.get_adapter(bookmaker)
         if not adapter:
+            browser_logger.warning(
+                f"No adapter for {bookmaker}",
+                extra={"event_type": "login_no_adapter", "bookmaker": bookmaker}
+            )
             return False
-        
+
         # Already logged in and session valid
         if adapter.session_status.session_valid:
+            browser_logger.debug(
+                f"Session valid for {bookmaker}",
+                extra={"event_type": "session_valid", "bookmaker": bookmaker}
+            )
             return True
-        
+
         # Check if we can attempt login (rate limiting)
         if not self._can_attempt_login(bookmaker):
-            logger.warning(f"[{bookmaker}] Login rate limited")
+            browser_logger.warning(
+                f"Login rate limited for {bookmaker}",
+                extra={"event_type": "login_rate_limited", "bookmaker": bookmaker}
+            )
             return False
-        
+
         # Check if too many failures
         if adapter.session_status.login_failures >= self.MAX_LOGIN_FAILURES:
-            logger.error(f"[{bookmaker}] Too many login failures")
+            browser_logger.error(
+                f"Too many login failures for {bookmaker}",
+                extra={
+                    "event_type": "login_max_failures",
+                    "bookmaker": bookmaker,
+                    "failures": adapter.session_status.login_failures
+                }
+            )
             return False
-        
+
         # Attempt login
+        browser_logger.info(
+            f"Attempting login for {bookmaker}",
+            extra={"event_type": "login_attempt", "bookmaker": bookmaker}
+        )
         self._last_login_attempt[bookmaker] = datetime.utcnow()
-        return adapter.login()
+
+        start_time = time.time()
+        success = adapter.login()
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if success:
+            browser_logger.info(
+                f"Login successful for {bookmaker}",
+                extra={
+                    "event_type": "login_success",
+                    "bookmaker": bookmaker,
+                    "duration_ms": duration_ms
+                }
+            )
+        else:
+            browser_logger.error(
+                f"Login failed for {bookmaker}",
+                extra={
+                    "event_type": "login_failed",
+                    "bookmaker": bookmaker,
+                    "duration_ms": duration_ms,
+                    "failures": adapter.session_status.login_failures
+                }
+            )
+
+        return success
     
     def _can_attempt_login(self, bookmaker: str) -> bool:
         """Check if enough time has passed since last login attempt."""

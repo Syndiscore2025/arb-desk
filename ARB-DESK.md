@@ -292,6 +292,10 @@ Control ArbDesk services directly from Slack:
 | `arb stop <service>` | Stop a running service |
 | `arb restart <service>` | Restart a service |
 | `arb scrape` | Trigger a market scrape |
+| `arb logs` | View recent logs (last 30 lines) |
+| `arb logs errors` | View only ERROR/CRITICAL logs |
+| `arb logs browser` | View browser-specific logs |
+| `arb logs summary` | View log statistics |
 
 **Available Services:**
 - `market_feed` - Browser scraping
@@ -320,6 +324,104 @@ arb scrape              # Trigger immediate scrape
 🟢 postgres: running
 🟢 slack_notifier: running
 ```
+
+### Log Viewing
+
+View browser and scraping logs directly from Slack:
+
+```
+arb logs              # Recent logs (last 30 lines)
+arb logs errors       # Only errors
+arb logs browser      # Browser navigation/scraping
+arb logs summary      # Statistics overview
+```
+
+**Log Summary Example:**
+```
+📊 Log Summary
+
+Total entries: 1234
+
+By Level:
+  • INFO: 1100
+  • WARNING: 120
+  • ERROR: 14
+
+By Bookmaker:
+  • fanduel: 450
+  • draftkings: 420
+  • fanatics: 364
+
+Recent Errors:
+  ⚠️ [fanduel] Login timeout after 30s
+  ⚠️ [draftkings] CAPTCHA detected
+```
+
+---
+
+## Logging System
+
+ArbDesk uses structured JSON logging for easy parsing and analysis.
+
+### Log Files
+
+| File | Location | Description |
+|------|----------|-------------|
+| `market_feed.log` | `/var/log/arb-desk/` | Main market feed logs |
+| `browser.log` | `/var/log/arb-desk/` | Browser-specific events |
+
+### Log Format (JSON)
+
+```json
+{
+  "timestamp": "2026-02-05T14:30:45.123Z",
+  "level": "INFO",
+  "service": "market_feed",
+  "logger": "market_feed.browser.session",
+  "message": "Login successful for fanduel",
+  "event_type": "login_success",
+  "bookmaker": "fanduel",
+  "duration_ms": 3421
+}
+```
+
+### Event Types
+
+| Event Type | Description |
+|------------|-------------|
+| `login_attempt` | Login attempt started |
+| `login_success` | Login completed successfully |
+| `login_failed` | Login failed |
+| `login_rate_limited` | Too many login attempts |
+| `session_valid` | Session still valid |
+| `page_navigation` | Page load started |
+| `page_loaded` | Page loaded successfully |
+| `scrape_start` | Scraping started |
+| `scrape_complete` | Scraping finished |
+| `ban_detected` | Ban/block detected |
+| `captcha_detected` | CAPTCHA challenge found |
+| `proxy_rotated` | Switched to new proxy |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_DIR` | `/var/log/arb-desk` | Directory for log files |
+| `LOG_LEVEL` | `INFO` | Minimum log level |
+| `LOG_FORMAT` | `json` | Log format (json/text) |
+| `MAX_LOG_SIZE_MB` | `50` | Max file size before rotation |
+| `LOG_BACKUP_COUNT` | `5` | Number of backup files |
+
+### HTTP Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /logs?lines=100` | Recent logs |
+| `GET /logs?level=ERROR` | Filter by level |
+| `GET /logs?bookmaker=fanduel` | Filter by bookmaker |
+| `GET /logs/browser` | Browser-specific logs |
+| `GET /logs/errors` | Only ERROR/CRITICAL |
+| `GET /logs/summary` | Statistics summary |
 
 ---
 

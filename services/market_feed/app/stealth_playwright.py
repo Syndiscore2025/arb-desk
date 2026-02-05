@@ -36,6 +36,7 @@ from playwright.async_api import (
 from shared.schemas import ProxyConfig
 
 logger = logging.getLogger(__name__)
+browser_logger = logging.getLogger("market_feed.browser.stealth")
 
 
 # 2026-current user agents (Chrome 120-125, Firefox 122-125, Safari 17.2-17.4)
