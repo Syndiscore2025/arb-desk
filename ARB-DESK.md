@@ -281,6 +281,46 @@ The system will:
 4. Place bets automatically
 5. Confirm in Slack
 
+### Service Control Commands
+
+Control ArbDesk services directly from Slack:
+
+| Command | Description |
+|---------|-------------|
+| `arb status` | Show status of all services |
+| `arb start <service>` | Start a stopped service |
+| `arb stop <service>` | Stop a running service |
+| `arb restart <service>` | Restart a service |
+| `arb scrape` | Trigger a market scrape |
+
+**Available Services:**
+- `market_feed` - Browser scraping
+- `odds_ingest` - Pipeline orchestrator
+- `arb_math` - Arbitrage calculator
+- `decision_gateway` - AI filtering
+- `browser_shadow` - Placeholder
+
+**Examples:**
+```
+arb status              # Show all service statuses
+arb stop market_feed    # Stop the scraper
+arb start market_feed   # Start the scraper
+arb restart arb_math    # Restart arb calculator
+arb scrape              # Trigger immediate scrape
+```
+
+**Status Response:**
+```
+📊 ArbDesk Service Status
+
+🟢 arb_math: running
+🟢 decision_gateway: running
+🟢 market_feed: running
+🟢 odds_ingest: running
+🟢 postgres: running
+🟢 slack_notifier: running
+```
+
 ---
 
 ## Configuration Guide

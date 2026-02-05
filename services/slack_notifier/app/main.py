@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import docker
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
@@ -27,6 +28,23 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL")
 MARKET_FEED_URL = os.getenv("MARKET_FEED_URL", "http://market_feed:8000")
+COMPOSE_PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "arb-desk")
+
+# Docker client for service control
+try:
+    docker_client = docker.from_env()
+except Exception as e:
+    logger.warning(f"Docker client unavailable: {e}")
+    docker_client = None
+
+# Valid services that can be controlled
+CONTROLLABLE_SERVICES = [
+    "market_feed",
+    "odds_ingest",
+    "arb_math",
+    "decision_gateway",
+    "browser_shadow",
+]
 
 # In-memory store for pending alerts (for bet command matching)
 # In production, use Redis or database
@@ -358,5 +376,167 @@ async def handle_slack_events(request: Request) -> Dict:
 
         result = await handle_bet_command(command)
         logger.info(f"Bet command result: {result}")
+        return {"ok": True}
+
+    # Parse service control commands: "arb start|stop|restart|status [service]"
+    arb_match = re.match(
+        r"arb\s+(start|stop|restart|status|scrape)(?:\s+(\S+))?",
+        text,
+        re.IGNORECASE,
+    )
+    if arb_match:
+        action = arb_match.group(1).lower()
+        service = arb_match.group(2)
+
+        result = await handle_service_control(action, service, user_id)
+        logger.info(f"Service control result: {result}")
 
     return {"ok": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service Control via Docker
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_container(service_name: str):
+    """Get Docker container for a service."""
+    if not docker_client:
+        return None
+
+    container_name = f"{COMPOSE_PROJECT}-{service_name}-1"
+    try:
+        return docker_client.containers.get(container_name)
+    except docker.errors.NotFound:
+        # Try alternate naming conventions
+        for container in docker_client.containers.list(all=True):
+            if service_name in container.name:
+                return container
+    except Exception as e:
+        logger.error(f"Error getting container {service_name}: {e}")
+    return None
+
+
+def _get_all_containers() -> Dict[str, dict]:
+    """Get status of all ArbDesk containers."""
+    if not docker_client:
+        return {}
+
+    result = {}
+    try:
+        for container in docker_client.containers.list(all=True):
+            # Match containers from our compose project
+            if COMPOSE_PROJECT in container.name or any(
+                svc in container.name for svc in CONTROLLABLE_SERVICES + ["postgres"]
+            ):
+                # Extract service name
+                name = container.name
+                for svc in CONTROLLABLE_SERVICES + ["postgres", "slack_notifier"]:
+                    if svc in name:
+                        result[svc] = {
+                            "status": container.status,
+                            "id": container.short_id,
+                        }
+                        break
+    except Exception as e:
+        logger.error(f"Error listing containers: {e}")
+
+    return result
+
+
+async def handle_service_control(action: str, service: Optional[str], user_id: str) -> Dict:
+    """Handle service control commands from Slack."""
+
+    if not docker_client:
+        msg = "❌ Docker control unavailable. Docker socket not mounted."
+        notify(SlackNotification(message=msg))
+        return {"success": False, "message": msg}
+
+    # Status command - show all services
+    if action == "status":
+        containers = _get_all_containers()
+        if not containers:
+            msg = "❌ No ArbDesk containers found."
+        else:
+            lines = ["📊 *ArbDesk Service Status*", ""]
+            for svc, info in sorted(containers.items()):
+                status = info["status"]
+                if status == "running":
+                    emoji = "🟢"
+                elif status == "exited":
+                    emoji = "🔴"
+                else:
+                    emoji = "🟡"
+                lines.append(f"{emoji} *{svc}*: {status}")
+            msg = "\n".join(lines)
+
+        notify(SlackNotification(message=msg))
+        return {"success": True, "message": msg}
+
+    # Scrape command - trigger market feed scrape
+    if action == "scrape":
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(f"{MARKET_FEED_URL}/scrape-all")
+                data = response.json()
+            msg = f"🔄 *Scrape triggered*\n{json.dumps(data, indent=2)}"
+        except Exception as e:
+            msg = f"❌ Scrape failed: {str(e)}"
+
+        notify(SlackNotification(message=msg))
+        return {"success": True, "message": msg}
+
+    # Service-specific commands
+    if not service:
+        msg = f"❌ Please specify a service: `arb {action} <service>`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
+        notify(SlackNotification(message=msg))
+        return {"success": False, "message": msg}
+
+    service = service.lower()
+    if service not in CONTROLLABLE_SERVICES:
+        msg = f"❌ Unknown service: `{service}`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
+        notify(SlackNotification(message=msg))
+        return {"success": False, "message": msg}
+
+    container = _get_container(service)
+    if not container:
+        msg = f"❌ Container for `{service}` not found."
+        notify(SlackNotification(message=msg))
+        return {"success": False, "message": msg}
+
+    try:
+        if action == "start":
+            container.start()
+            msg = f"✅ Started `{service}`"
+        elif action == "stop":
+            container.stop(timeout=10)
+            msg = f"🛑 Stopped `{service}`"
+        elif action == "restart":
+            container.restart(timeout=10)
+            msg = f"🔄 Restarted `{service}`"
+        else:
+            msg = f"❌ Unknown action: `{action}`"
+
+    except Exception as e:
+        msg = f"❌ Failed to {action} `{service}`: {str(e)}"
+
+    notify(SlackNotification(message=msg))
+    return {"success": True, "message": msg}
+
+
+@app.get("/services/status")
+async def get_services_status() -> Dict:
+    """Get status of all ArbDesk services."""
+    if not docker_client:
+        raise HTTPException(status_code=503, detail="Docker not available")
+
+    return {"services": _get_all_containers()}
+
+
+@app.post("/services/{service}/{action}")
+async def control_service(service: str, action: str) -> Dict:
+    """Control a service via API."""
+    if action not in ["start", "stop", "restart"]:
+        raise HTTPException(status_code=400, detail=f"Invalid action: {action}")
+
+    return await handle_service_control(action, service, "api")

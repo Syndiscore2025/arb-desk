@@ -75,8 +75,11 @@ services:
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
       SLACK_DEFAULT_CHANNEL: ${SLACK_DEFAULT_CHANNEL}
+      COMPOSE_PROJECT_NAME: arb-desk
     ports:
       - "8005:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
   market_feed:
     build:
