@@ -1,0 +1,22 @@
+# FastAPI and server
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+httpx==0.26.0
+pydantic==2.6.1
+
+# Playwright for advanced browser automation (2026 stealth)
+playwright==1.41.0
+playwright-stealth==2.0.1
+
+# Selenium for browser automation (legacy/fallback)
+selenium==4.18.1
+selenium-stealth==1.0.6
+webdriver-manager==4.0.1
+undetected-chromedriver==3.5.5
+
+# Additional utilities
+fake-useragent==1.4.0
+python-dotenv==1.0.1
+pyotp==2.9.0  # For TOTP 2FA code generation
+bezier==2023.7.28  # For realistic mouse curves
+

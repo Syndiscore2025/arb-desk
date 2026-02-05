@@ -78,5 +78,22 @@ services:
     ports:
       - "8005:8000"
 
+  market_feed:
+    build:
+      context: .
+      dockerfile: services/market_feed/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: market_feed
+      ODDS_INGEST_URL: http://odds_ingest:8000
+      FEED_CONFIGS: ${FEED_CONFIGS:-[]}
+      BOOKMAKER_CREDENTIALS: ${BOOKMAKER_CREDENTIALS:-{}}
+    depends_on:
+      - odds_ingest
+    ports:
+      - "8006:8000"
+    # Chrome needs shared memory
+    shm_size: '2gb'
+
 volumes:
   pgdata:
