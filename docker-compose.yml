@@ -1,0 +1,78 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  odds_ingest:
+    build:
+      context: .
+      dockerfile: services/odds_ingest/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: odds_ingest
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      - postgres
+    ports:
+      - "8001:8000"
+
+  arb_math:
+    build:
+      context: .
+      dockerfile: services/arb_math/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: arb_math
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      - postgres
+    ports:
+      - "8002:8000"
+
+  browser_shadow:
+    build:
+      context: .
+      dockerfile: services/browser_shadow/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: browser_shadow
+    ports:
+      - "8003:8000"
+
+  decision_gateway:
+    build:
+      context: .
+      dockerfile: services/decision_gateway/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: decision_gateway
+      AI_API_URL: ${AI_API_URL}
+      AI_API_KEY: ${AI_API_KEY}
+      AI_MODEL: ${AI_MODEL}
+    ports:
+      - "8004:8000"
+
+  slack_notifier:
+    build:
+      context: .
+      dockerfile: services/slack_notifier/Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: slack_notifier
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_DEFAULT_CHANNEL: ${SLACK_DEFAULT_CHANNEL}
+    ports:
+      - "8005:8000"
+
+volumes:
+  pgdata:
