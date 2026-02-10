@@ -142,6 +142,31 @@ LOG_LEVEL=INFO
 LOG_FORMAT=json
 ```
 
+### Optional: AI Reasoning for Stealth Advisor
+
+The Stealth Advisor works fully without an API key (rule-based logic). To enable LLM-enhanced reasoning, add:
+
+```bash
+# OpenAI or Azure OpenAI (optional)
+AI_API_URL=https://api.openai.com/v1/chat/completions
+AI_API_KEY=sk-your-openai-api-key
+AI_MODEL=gpt-4o-mini
+```
+
+> **Cost:** gpt-4o-mini is ~$0.15/million input tokens. Even heavy use costs pennies/day. If omitted, the rule-based engine handles all decisions.
+
+### Optional: Stealth Advisor Tuning
+
+These control how aggressively the anti-ban system protects your accounts. Defaults work well for most users:
+
+```bash
+# Stealth Advisor thresholds (optional - defaults shown)
+STEALTH_MAX_WIN_RATE=0.72        # Win rate that triggers cover bets (72%)
+STEALTH_MAX_ARBS_PER_DAY=12      # Max arb bets per bookmaker per day
+STEALTH_HEAT_DECAY_HOURS=18      # Hours for heat score to decay by half
+STEALTH_COVER_BET_PROB=0.05      # Random cover bet probability (5%)
+```
+
 ---
 
 ## 5. Build and Launch
@@ -181,7 +206,12 @@ arb-desk-browser_shadow Up
 # Test service health
 curl http://localhost:8001/health  # odds_ingest
 curl http://localhost:8002/health  # arb_math
+curl http://localhost:8004/health  # decision_gateway
+curl http://localhost:8005/health  # slack_notifier
 curl http://localhost:8006/health  # market_feed
+
+# Check Stealth Advisor heat scores
+curl http://localhost:8004/heat
 
 # Trigger a test scrape
 curl -X POST http://localhost:8006/scrape-all
@@ -286,6 +316,9 @@ arb logs              # Recent logs
 arb logs errors       # Only errors
 arb logs browser      # Browser activity
 arb logs summary      # Statistics
+arb heat              # View all bookmaker heat scores
+arb heat fanduel      # View heat for specific book
+arb cool fanduel      # Force 24h cooling period for a book
 ```
 
 ### Restart Services
@@ -380,4 +413,18 @@ If still crashing, increase to `4gb`.
 | Restart service | `docker compose restart market_feed` |
 | Rebuild | `docker compose build && docker compose up -d` |
 | Check status | `docker compose ps` |
+| View heat scores | `curl http://localhost:8004/heat` |
+| Force cooling | `curl -X POST http://localhost:8004/cool -H "Content-Type: application/json" -d '{"bookmaker":"fanduel","hours":24}'` |
+
+### Slack Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `arb status` | All service statuses |
+| `arb start/stop/restart <service>` | Control a service |
+| `arb scrape` | Trigger immediate scrape |
+| `arb logs [errors\|browser\|summary]` | View logs |
+| `arb heat` | View all heat scores |
+| `arb heat <book>` | View specific book heat |
+| `arb cool <book>` | Force 24h cooling period |
 
