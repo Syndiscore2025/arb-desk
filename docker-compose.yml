@@ -1,19 +1,26 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   odds_ingest:
     build:
       context: .
       dockerfile: services/odds_ingest/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: odds_ingest
@@ -22,69 +29,110 @@ services:
       DECISION_GATEWAY_URL: http://decision_gateway:8000
       SLACK_NOTIFIER_URL: http://slack_notifier:8000
     depends_on:
-      - postgres
-      - arb_math
-      - decision_gateway
-      - slack_notifier
+      postgres:
+        condition: service_healthy
+      arb_math:
+        condition: service_healthy
+      decision_gateway:
+        condition: service_healthy
+      slack_notifier:
+        condition: service_healthy
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   arb_math:
     build:
       context: .
       dockerfile: services/arb_math/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: arb_math
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
-      - "8002:8000"
+      - "127.0.0.1:8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   browser_shadow:
     build:
       context: .
       dockerfile: services/browser_shadow/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: browser_shadow
     ports:
-      - "8003:8000"
+      - "127.0.0.1:8003:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   decision_gateway:
     build:
       context: .
       dockerfile: services/decision_gateway/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: decision_gateway
-      AI_API_URL: ${AI_API_URL}
-      AI_API_KEY: ${AI_API_KEY}
-      AI_MODEL: ${AI_MODEL}
+      AI_API_URL: ${AI_API_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-gpt-4o-mini}
     ports:
-      - "8004:8000"
+      - "127.0.0.1:8004:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   slack_notifier:
     build:
       context: .
       dockerfile: services/slack_notifier/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: slack_notifier
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
       SLACK_DEFAULT_CHANNEL: ${SLACK_DEFAULT_CHANNEL}
+      DECISION_GATEWAY_URL: http://decision_gateway:8000
       COMPOSE_PROJECT_NAME: arb-desk
     ports:
-      - "8005:8000"
+      - "127.0.0.1:8005:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   market_feed:
     build:
       context: .
       dockerfile: services/market_feed/Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       SERVICE_NAME: market_feed
@@ -95,13 +143,20 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     depends_on:
-      - odds_ingest
+      odds_ingest:
+        condition: service_healthy
     ports:
-      - "8006:8000"
+      - "127.0.0.1:8006:8000"
     volumes:
       - arb-logs:/var/log/arb-desk
     # Chrome needs shared memory
     shm_size: '2gb'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:
