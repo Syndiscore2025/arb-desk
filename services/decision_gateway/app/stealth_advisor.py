@@ -32,11 +32,11 @@ AI_API_URL = os.getenv("AI_API_URL")
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 
-# Stealth thresholds
-MAX_WIN_RATE_BEFORE_COOLING = 0.65  # 65% win rate triggers cooling
-MAX_ARB_FREQUENCY_PER_DAY = 5  # Max arb bets per book per day
-HEAT_DECAY_HOURS = 24  # Hours for heat to decay by half
-COVER_BET_PROBABILITY = 0.15  # 15% chance to suggest a cover bet
+# Stealth thresholds - configurable via environment variables
+MAX_WIN_RATE_BEFORE_COOLING = float(os.getenv("STEALTH_MAX_WIN_RATE", "0.72"))  # 72% win rate triggers cooling
+MAX_ARB_FREQUENCY_PER_DAY = int(os.getenv("STEALTH_MAX_ARBS_PER_DAY", "12"))  # Max arb bets per book per day
+HEAT_DECAY_HOURS = int(os.getenv("STEALTH_HEAT_DECAY_HOURS", "18"))  # Hours for heat to decay by half
+COVER_BET_PROBABILITY = float(os.getenv("STEALTH_COVER_BET_PROB", "0.05"))  # 5% chance to suggest a cover bet
 
 
 @dataclass
@@ -100,25 +100,25 @@ class BookmakerProfile:
             self.bet_history.pop(0)
 
     def _update_heat_score(self) -> None:
-        """Calculate heat score based on suspicious patterns."""
+        """Calculate heat score based on suspicious patterns. LOOSENED."""
         heat = 0.0
 
-        # Win rate factor (0-30 points)
-        if self.total_bets >= 10:
+        # Win rate factor (0-25 points) - only kicks in at higher win rates
+        if self.total_bets >= 15:
             win_rate = self.wins / self.total_bets
-            if win_rate > 0.55:
-                heat += (win_rate - 0.55) * 100  # Up to 30 for 85% win rate
+            if win_rate > 0.60:
+                heat += (win_rate - 0.60) * 80  # Up to 24 for 90% win rate
 
-        # Arb frequency factor (0-30 points)
+        # Arb frequency factor (0-20 points) - reduced weight
         if self.total_bets > 0:
             arb_ratio = self.arb_bets / self.total_bets
-            heat += arb_ratio * 30
+            heat += arb_ratio * 20
 
-        # Daily arb frequency (0-20 points)
-        heat += min(self.arb_bets_today * 4, 20)
+        # Daily arb frequency (0-15 points) - more lenient
+        heat += min(self.arb_bets_today * 1.5, 15)
 
-        # Consecutive wins (0-20 points)
-        heat += min(self.consecutive_wins * 4, 20)
+        # Consecutive wins (0-15 points) - takes longer to build
+        heat += min(self.consecutive_wins * 2.5, 15)
 
         self.heat_score = min(heat, 100)
 
@@ -131,15 +131,15 @@ class BookmakerProfile:
 
     @property
     def is_hot(self) -> bool:
-        """Check if account is running hot (suspicious)."""
-        return self.heat_score >= 60
+        """Check if account is running hot (suspicious). LOOSENED."""
+        return self.heat_score >= 70
 
     @property
     def needs_cooling(self) -> bool:
-        """Check if account needs a cooling period."""
+        """Check if account needs a cooling period. LOOSENED."""
         if self.cooling_until and datetime.utcnow() < self.cooling_until:
             return True
-        return self.heat_score >= 80
+        return self.heat_score >= 90  # Only force cooling at 90+
 
     def start_cooling(self, hours: int = 24) -> None:
         """Start a cooling period."""
@@ -370,41 +370,43 @@ class StealthAdvisor:
         Calculate the probability of strategically skipping an opportunity.
         Higher heat = skip more. Lower quality = skip more.
         Live bets are riskier so skip more.
+
+        LOOSENED: Only skip when really necessary.
         """
         base_skip = 0.0
 
-        # Quality-based skip rate
+        # Quality-based skip rate (loosened significantly)
         if quality == "high":
-            base_skip = 0.05  # Only skip 5% of >3% arbs
+            base_skip = 0.02  # Only skip 2% of >3% arbs - almost never skip these
         elif quality == "medium":
-            base_skip = 0.15  # Skip 15% of 1.5-3% arbs
+            base_skip = 0.06  # Skip 6% of 1.5-3% arbs
         else:
-            base_skip = 0.35  # Skip 35% of <1.5% arbs (not worth heat)
+            base_skip = 0.12  # Skip 12% of <1.5% arbs
 
-        # Heat modifier - skip more when running hot
-        if max_heat > 60:
-            base_skip += 0.20
-        elif max_heat > 40:
-            base_skip += 0.10
-        elif max_heat > 20:
+        # Heat modifier - only skip more when really hot
+        if max_heat > 75:
+            base_skip += 0.15
+        elif max_heat > 55:
+            base_skip += 0.08
+        elif max_heat > 35:
+            base_skip += 0.03
+
+        # Live betting - small additional skip
+        if is_live:
             base_skip += 0.05
 
-        # Live betting is riskier for detection
-        if is_live:
-            base_skip += 0.10
-
-        return min(base_skip, 0.80)  # Never skip more than 80%
+        return min(base_skip, 0.50)  # Never skip more than 50%
 
     def _should_suggest_cover(self, profiles: Dict[str, BookmakerProfile]) -> bool:
-        """Determine if a cover bet should be placed before the arb."""
+        """Determine if a cover bet should be placed before the arb. LOOSENED."""
         for profile in profiles.values():
-            # Suggest cover if win rate is too high
-            if profile.total_bets >= 10 and profile.win_rate > MAX_WIN_RATE_BEFORE_COOLING:
+            # Suggest cover only if win rate is very high
+            if profile.total_bets >= 20 and profile.win_rate > MAX_WIN_RATE_BEFORE_COOLING:
                 return True
-            # Suggest cover after consecutive wins
-            if profile.consecutive_wins >= 4:
+            # Suggest cover after long consecutive win streak
+            if profile.consecutive_wins >= 7:
                 return True
-            # Random cover bet to break patterns
+            # Random cover bet - now much rarer (5% default)
             if random.random() < COVER_BET_PROBABILITY:
                 return True
         return False
@@ -469,14 +471,14 @@ class StealthAdvisor:
         return delay
 
     def _calculate_stake_modifier(self, max_heat: float, quality: str) -> float:
-        """Calculate stake reduction factor based on heat and quality."""
+        """Calculate stake reduction factor based on heat and quality. LOOSENED."""
+        if max_heat > 85:
+            return 0.6  # Reduce to 60% only when very hot
         if max_heat > 70:
-            return 0.5  # Reduce to 50%
-        if max_heat > 50:
-            return 0.75  # Reduce to 75%
-        if quality == "low":
-            return 0.8  # Small bets on low-quality arbs
-        return 1.0
+            return 0.8  # Reduce to 80%
+        if quality == "low" and max_heat > 50:
+            return 0.85  # Slight reduction on low-quality when warm
+        return 1.0  # Full stakes most of the time
 
     async def _ai_reasoning(
         self,

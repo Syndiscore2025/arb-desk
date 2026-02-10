@@ -384,11 +384,21 @@ The Stealth Advisor is an AI-powered reasoning agent that helps extend account l
 
 | Score | Status | Action |
 |-------|--------|--------|
-| 0-20 | 🟢 Cool | Normal betting |
-| 20-40 | 🟢 Warm | Light monitoring |
-| 40-60 | 🟡 Hot | Increased skip rate, stake reduction |
-| 60-80 | 🔥 Very Hot | Heavy skip rate, cover bets suggested |
-| 80-100 | 🧊 Critical | Cooling period required |
+| 0-35 | 🟢 Cool | Normal betting, full stakes |
+| 35-55 | 🟢 Warm | Light monitoring, minimal skip |
+| 55-70 | 🟡 Elevated | Slight skip increase |
+| 70-85 | 🔥 Hot | Moderate skip rate, stake reduction to 80% |
+| 85-90 | 🔥 Very Hot | Higher skip rate, stake reduction to 60% |
+| 90-100 | 🧊 Critical | Cooling period required |
+
+### Environment Variables (Tunable)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STEALTH_MAX_WIN_RATE` | 0.72 | Win rate that triggers cover bet suggestions |
+| `STEALTH_MAX_ARBS_PER_DAY` | 12 | Max arb bets per bookmaker per day |
+| `STEALTH_HEAT_DECAY_HOURS` | 18 | Hours for heat to decay by half |
+| `STEALTH_COVER_BET_PROB` | 0.05 | Random cover bet probability (5%) |
 
 ### Slack Commands
 
