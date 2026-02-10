@@ -28,6 +28,7 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL")
 MARKET_FEED_URL = os.getenv("MARKET_FEED_URL", "http://market_feed:8000")
+DECISION_GATEWAY_URL = os.getenv("DECISION_GATEWAY_URL", "http://decision_gateway:8000")
 COMPOSE_PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "arb-desk")
 
 # Docker client for service control
@@ -378,9 +379,9 @@ async def handle_slack_events(request: Request) -> Dict:
         logger.info(f"Bet command result: {result}")
         return {"ok": True}
 
-    # Parse service control commands: "arb start|stop|restart|status|logs [service]"
+    # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool [service]"
     arb_match = re.match(
-        r"arb\s+(start|stop|restart|status|scrape|logs)(?:\s+(\S+))?",
+        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool)(?:\s+(\S+))?",
         text,
         re.IGNORECASE,
     )
@@ -390,6 +391,10 @@ async def handle_slack_events(request: Request) -> Dict:
 
         if action == "logs":
             result = await handle_logs_command(arg, user_id)
+        elif action == "heat":
+            result = await handle_heat_command(arg, user_id)
+        elif action == "cool":
+            result = await handle_cool_command(arg, user_id)
         else:
             result = await handle_service_control(action, arg, user_id)
         logger.info(f"Command result: {result}")
@@ -625,3 +630,133 @@ async def control_service(service: str, action: str) -> Dict:
         raise HTTPException(status_code=400, detail=f"Invalid action: {action}")
 
     return await handle_service_control(action, service, "api")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stealth Heat Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def handle_heat_command(bookmaker: Optional[str], user_id: str) -> Dict:
+    """
+    Handle heat score viewing commands from Slack.
+
+    Usage:
+        arb heat           - Get heat scores for all bookmakers
+        arb heat fanduel   - Get heat score for specific bookmaker
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if bookmaker:
+                response = await client.get(f"{DECISION_GATEWAY_URL}/heat/{bookmaker}")
+                response.raise_for_status()
+                data = response.json()
+
+                # Format single bookmaker heat
+                heat = data.get("heat_score", 0)
+                heat_emoji = "🔥" if heat > 60 else "🟡" if heat > 40 else "🟢"
+
+                lines = [
+                    f"{heat_emoji} *Heat Score for {bookmaker.upper()}*",
+                    "",
+                    f"*Heat Score:* {heat}/100",
+                    f"*Win Rate:* {data.get('win_rate', 0):.1%}",
+                    f"*Total Bets:* {data.get('total_bets', 0)}",
+                    f"*Arb Bets Today:* {data.get('arb_bets_today', 0)}",
+                    f"*Consecutive Wins:* {data.get('consecutive_wins', 0)}",
+                ]
+
+                if data.get("needs_cooling"):
+                    lines.append("")
+                    lines.append("⚠️ *COOLING REQUIRED* - Account at risk!")
+
+                if data.get("cooling_until"):
+                    lines.append(f"*Cooling Until:* {data.get('cooling_until')}")
+
+                message = "\n".join(lines)
+            else:
+                response = await client.get(f"{DECISION_GATEWAY_URL}/heat")
+                response.raise_for_status()
+                data = response.json()
+                bookmakers = data.get("bookmakers", {})
+
+                if not bookmakers:
+                    message = "📊 No bookmaker heat data yet. Start placing bets to track heat."
+                else:
+                    lines = ["🌡️ *Bookmaker Heat Scores*", ""]
+
+                    for bm, info in sorted(bookmakers.items()):
+                        heat = info.get("heat_score", 0)
+                        heat_emoji = "🔥" if heat > 60 else "🟡" if heat > 40 else "🟢"
+                        cooling = " 🧊 COOLING" if info.get("needs_cooling") else ""
+                        lines.append(
+                            f"{heat_emoji} *{bm}*: {heat:.0f}/100 "
+                            f"(WR: {info.get('win_rate', 0):.0%}, "
+                            f"Bets: {info.get('total_bets', 0)}, "
+                            f"Wins: {info.get('consecutive_wins', 0)}){cooling}"
+                        )
+
+                    lines.append("")
+                    lines.append("_Use `arb cool <bookmaker>` to force a cooling period._")
+                    message = "\n".join(lines)
+
+            await _send_slack_response(message, user_id)
+            return {"ok": True, "sent": True}
+
+    except Exception as e:
+        logger.error(f"Heat command failed: {e}")
+        await _send_slack_response(f"❌ Failed to get heat scores: {e}", user_id)
+        return {"ok": False, "error": str(e)}
+
+
+async def handle_cool_command(bookmaker: Optional[str], user_id: str) -> Dict:
+    """
+    Handle cooling command from Slack.
+
+    Usage:
+        arb cool fanduel   - Force FanDuel into 24h cooling period
+    """
+    if not bookmaker:
+        await _send_slack_response(
+            "❌ Usage: `arb cool <bookmaker>` (e.g., `arb cool fanduel`)",
+            user_id,
+        )
+        return {"ok": False, "error": "Bookmaker required"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{DECISION_GATEWAY_URL}/cool",
+                json={"bookmaker": bookmaker, "hours": 24},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            message = (
+                f"🧊 *Cooling Started for {bookmaker.upper()}*\n\n"
+                f"*Duration:* {data.get('hours', 24)} hours\n"
+                f"*Until:* {data.get('cooling_until', 'Unknown')}\n\n"
+                f"No arb bets will be recommended for this bookmaker during the cooling period."
+            )
+            await _send_slack_response(message, user_id)
+            return {"ok": True, "cooling_started": True}
+
+    except Exception as e:
+        logger.error(f"Cool command failed: {e}")
+        await _send_slack_response(f"❌ Failed to start cooling: {e}", user_id)
+        return {"ok": False, "error": str(e)}
+
+
+async def _send_slack_response(message: str, user_id: str) -> None:
+    """Send a response message to Slack."""
+    if SLACK_BOT_TOKEN:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                json={
+                    "channel": DEFAULT_CHANNEL or user_id,
+                    "text": message,
+                    "mrkdwn": True,
+                },
+            )

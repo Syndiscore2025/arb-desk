@@ -359,6 +359,93 @@ Recent Errors:
 
 ---
 
+## Stealth Advisor (Anti-Ban System)
+
+The Stealth Advisor is an AI-powered reasoning agent that helps extend account longevity by strategically managing betting patterns to avoid sportsbook detection.
+
+### How It Works
+
+1. **Heat Tracking**: Each bookmaker has a "heat score" (0-100) based on:
+   - Win rate (higher = more suspicious)
+   - Arb bet frequency (too many arbs = flagged)
+   - Consecutive wins (streaks trigger alerts)
+   - Daily betting patterns
+
+2. **Strategic Decisions**: The advisor may recommend:
+   - **Take**: Place the arb bet normally
+   - **Skip**: Pass on this opportunity to maintain recreational pattern
+   - **Cover**: Place a small "cover bet" (parlay, favorite ML) to look casual
+   - **Delay**: Wait before placing to randomize timing
+   - **Cool**: Account needs a cooling period (no betting)
+
+3. **Stake Modifications**: Reduces stake sizes when heat is elevated
+
+### Heat Score Thresholds
+
+| Score | Status | Action |
+|-------|--------|--------|
+| 0-20 | 🟢 Cool | Normal betting |
+| 20-40 | 🟢 Warm | Light monitoring |
+| 40-60 | 🟡 Hot | Increased skip rate, stake reduction |
+| 60-80 | 🔥 Very Hot | Heavy skip rate, cover bets suggested |
+| 80-100 | 🧊 Critical | Cooling period required |
+
+### Slack Commands
+
+| Command | Description |
+|---------|-------------|
+| `arb heat` | View heat scores for all bookmakers |
+| `arb heat fanduel` | View heat for specific bookmaker |
+| `arb cool fanduel` | Force 24h cooling period |
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/heat` | GET | Get all bookmaker heat scores |
+| `/heat/{bookmaker}` | GET | Get specific bookmaker heat |
+| `/record-bet` | POST | Record bet result for tracking |
+| `/cool` | POST | Force cooling period |
+
+### Example Heat Response
+
+```json
+{
+  "bookmakers": {
+    "fanduel": {
+      "heat_score": 45.2,
+      "win_rate": 0.62,
+      "total_bets": 28,
+      "arb_bets_today": 3,
+      "consecutive_wins": 2,
+      "is_hot": false,
+      "needs_cooling": false
+    },
+    "draftkings": {
+      "heat_score": 72.5,
+      "win_rate": 0.71,
+      "total_bets": 35,
+      "arb_bets_today": 5,
+      "consecutive_wins": 4,
+      "is_hot": true,
+      "needs_cooling": false
+    }
+  }
+}
+```
+
+### Cover Bet Suggestions
+
+When the advisor recommends a cover bet, it suggests:
+- Small parlays ($5-15) on popular games
+- Heavy favorite moneylines ($10-25)
+- Player props on star players ($5-10)
+- Same-game parlays ($10-20)
+
+These intentional small losses make the account appear recreational.
+
+---
+
 ## Logging System
 
 ArbDesk uses structured JSON logging for easy parsing and analysis.
