@@ -6,11 +6,13 @@ using stealth browser automation. It pushes normalized odds to odds_ingest.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import httpx
@@ -29,6 +31,8 @@ from shared.schemas import (
     MarketOdds,
     ProxyConfig,
     ScrapeResult,
+    TwoFARequest,
+    TwoFASubmission,
 )
 from shared.logging_config import setup_logging
 from .session_manager import session_manager
@@ -41,10 +45,15 @@ browser_logger = logging.getLogger("market_feed.browser")
 # Environment configuration
 SERVICE_NAME = os.getenv("SERVICE_NAME", "market_feed")
 ODDS_INGEST_URL = os.getenv("ODDS_INGEST_URL", "http://odds_ingest:8000")
+SLACK_NOTIFIER_URL = os.getenv("SLACK_NOTIFIER_URL", "http://slack_notifier:8000")
 
 # Feed configurations from environment
 FEED_CONFIGS_JSON = os.getenv("FEED_CONFIGS", "[]")
 BOOKMAKER_CREDENTIALS_JSON = os.getenv("BOOKMAKER_CREDENTIALS", "{}")
+
+# In-memory stores for Slack-based 2FA
+_pending_2fa_requests: Dict[str, TwoFARequest] = {}
+_submitted_2fa_codes: Dict[str, str] = {}
 
 app = FastAPI(title="Market Feed", version="0.1.0")
 
@@ -505,3 +514,180 @@ async def get_log_summary() -> Dict:
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slack-Based 2FA Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _cleanup_expired_2fa_requests() -> None:
+    """Remove expired 2FA requests from the pending store."""
+    now = datetime.utcnow()
+    expired_ids = [
+        req_id for req_id, req in _pending_2fa_requests.items()
+        if req.expires_at < now
+    ]
+    for req_id in expired_ids:
+        _pending_2fa_requests[req_id].status = "expired"
+        _pending_2fa_requests.pop(req_id, None)
+        _submitted_2fa_codes.pop(req_id, None)
+
+
+@app.post("/2fa/create")
+async def create_2fa_request(payload: Dict) -> Dict:
+    """
+    Create a new 2FA request and notify user via Slack.
+
+    Called by adapters when they detect a 2FA prompt on the page.
+    """
+    bookmaker = payload.get("bookmaker", "unknown")
+
+    # Generate request ID
+    request_id = str(uuid.uuid4())
+    short_id = request_id[:8]
+
+    # Create request with 5 minute expiry
+    now = datetime.utcnow()
+    request = TwoFARequest(
+        request_id=request_id,
+        bookmaker=bookmaker,
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+        status="pending",
+    )
+
+    _pending_2fa_requests[request_id] = request
+
+    # Send Slack notification
+    try:
+        slack_message = (
+            f"🔐 *{bookmaker.upper()}* needs a 2FA code.\n"
+            f"Check your phone for the SMS/email.\n"
+            f"Reply with: `2fa {short_id} <code>`"
+        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{SLACK_NOTIFIER_URL}/notify",
+                json={"message": slack_message},
+            )
+        logger.info(f"[{bookmaker}] Created 2FA request {short_id}, notified Slack")
+    except Exception as e:
+        logger.error(f"[{bookmaker}] Failed to send Slack notification: {e}")
+
+    return {"request_id": request_id, "short_id": short_id}
+
+
+@app.get("/2fa/pending")
+async def get_pending_2fa_requests() -> Dict:
+    """Get all pending 2FA requests."""
+    _cleanup_expired_2fa_requests()
+
+    pending = [
+        {
+            "request_id": req.request_id,
+            "short_id": req.request_id[:8],
+            "bookmaker": req.bookmaker,
+            "created_at": req.created_at.isoformat(),
+            "expires_at": req.expires_at.isoformat(),
+            "status": req.status,
+        }
+        for req in _pending_2fa_requests.values()
+        if req.status == "pending"
+    ]
+
+    return {"pending": pending, "count": len(pending)}
+
+
+@app.post("/2fa/submit")
+async def submit_2fa_code(submission: TwoFASubmission) -> Dict:
+    """
+    Submit a 2FA code for a pending request.
+
+    Called by slack_notifier when user provides a code via Slack.
+    """
+    _cleanup_expired_2fa_requests()
+
+    # Find request by full ID or short prefix
+    request_id = submission.request_id
+    request = _pending_2fa_requests.get(request_id)
+
+    if not request:
+        # Try prefix match
+        for req_id, req in _pending_2fa_requests.items():
+            if req_id.startswith(request_id) or request_id.startswith(req_id[:8]):
+                request = req
+                request_id = req_id
+                break
+
+    if not request:
+        return {"success": False, "error": f"Request {submission.request_id} not found"}
+
+    if request.status != "pending":
+        return {"success": False, "error": f"Request already {request.status}"}
+
+    # Store the code and update status
+    _submitted_2fa_codes[request_id] = submission.code
+    request.status = "submitted"
+
+    logger.info(f"[{request.bookmaker}] 2FA code submitted by {submission.submitted_by}")
+
+    return {"success": True, "bookmaker": request.bookmaker}
+
+
+@app.get("/2fa/check/{request_id}")
+async def check_2fa_status(request_id: str) -> Dict:
+    """Check the status of a 2FA request and retrieve submitted code if available."""
+    _cleanup_expired_2fa_requests()
+
+    # Find request by full ID or short prefix
+    request = _pending_2fa_requests.get(request_id)
+
+    if not request:
+        for req_id, req in _pending_2fa_requests.items():
+            if req_id.startswith(request_id) or request_id.startswith(req_id[:8]):
+                request = req
+                request_id = req_id
+                break
+
+    if not request:
+        return {"status": "not_found", "code": None}
+
+    code = _submitted_2fa_codes.get(request_id)
+
+    return {
+        "status": request.status,
+        "code": code,
+        "bookmaker": request.bookmaker,
+    }
+
+
+async def wait_for_2fa_code(request_id: str, timeout_seconds: int = 300) -> Optional[str]:
+    """
+    Poll for a 2FA code submission.
+
+    Called by adapters after creating a 2FA request. Waits up to timeout_seconds
+    for the user to submit a code via Slack.
+
+    Args:
+        request_id: The full UUID of the 2FA request
+        timeout_seconds: Maximum time to wait (default 5 minutes)
+
+    Returns:
+        The submitted code, or None if timeout/expired
+    """
+    start_time = time.time()
+
+    while time.time() - start_time < timeout_seconds:
+        if request_id in _submitted_2fa_codes:
+            code = _submitted_2fa_codes.pop(request_id)
+            _pending_2fa_requests.pop(request_id, None)
+            return code
+        await asyncio.sleep(2)
+
+    # Timeout - mark as expired
+    if request_id in _pending_2fa_requests:
+        _pending_2fa_requests[request_id].status = "expired"
+        _pending_2fa_requests.pop(request_id, None)
+
+    return None

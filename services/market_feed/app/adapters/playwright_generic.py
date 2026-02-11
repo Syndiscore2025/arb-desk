@@ -144,6 +144,8 @@ class PlaywrightGenericAdapter(PlaywrightFeedAdapter):
                 code = await self._poll_sms_code(two_factor)
             elif two_factor.method == "email":
                 code = await self._poll_email_code(two_factor)
+            elif two_factor.method == "slack":
+                code = await self._request_slack_2fa_code()
             else:
                 logger.error(f"[{self.bookmaker}] Unknown 2FA method: {two_factor.method}")
                 return False
@@ -189,6 +191,40 @@ class PlaywrightGenericAdapter(PlaywrightFeedAdapter):
     async def _poll_email_code(self, two_factor) -> Optional[str]:
         """Poll Email API for 2FA code."""
         return await self._poll_2fa_api(two_factor)
+
+    async def _request_slack_2fa_code(self) -> Optional[str]:
+        """
+        Request 2FA code from user via Slack.
+
+        Creates a 2FA request, notifies the user via Slack, and waits
+        for them to submit the code they received on their phone.
+        """
+        try:
+            # Create 2FA request via market_feed API
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "http://localhost:8000/2fa/create",
+                    json={"bookmaker": self.bookmaker},
+                )
+                data = response.json()
+                request_id = data["request_id"]
+
+            logger.info(f"[{self.bookmaker}] Waiting for 2FA code from Slack (request_id={request_id[:8]})")
+
+            # Wait for user to submit code (5 minute timeout)
+            from ..main import wait_for_2fa_code
+            code = await wait_for_2fa_code(request_id, timeout_seconds=300)
+
+            if code:
+                logger.info(f"[{self.bookmaker}] Received 2FA code from Slack")
+                return code
+            else:
+                logger.error(f"[{self.bookmaker}] Timeout waiting for 2FA code from Slack")
+                return None
+
+        except Exception as e:
+            logger.error(f"[{self.bookmaker}] Failed to request Slack 2FA code: {e}")
+            return None
 
     async def _poll_2fa_api(self, two_factor) -> Optional[str]:
         """Poll API endpoint for 2FA code."""

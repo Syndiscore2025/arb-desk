@@ -193,6 +193,9 @@ class GenericSportsbookAdapter(BaseFeedAdapter):
         elif twofa.method == "email":
             return self._fetch_code_from_api(twofa, "email")
 
+        elif twofa.method == "slack":
+            return self._request_slack_2fa_code()
+
         else:
             logger.error(f"[{self.bookmaker}] Unknown 2FA method: {twofa.method}")
             return None
@@ -265,6 +268,59 @@ class GenericSportsbookAdapter(BaseFeedAdapter):
 
         logger.error(f"[{self.bookmaker}] Timeout waiting for {method_name} code")
         return None
+
+    def _request_slack_2fa_code(self) -> Optional[str]:
+        """
+        Request 2FA code from user via Slack.
+
+        Creates a 2FA request, notifies the user via Slack, and waits
+        for them to submit the code they received on their phone.
+
+        Note: This is a synchronous method that blocks while waiting for the code.
+        """
+        import asyncio
+
+        try:
+            # Create 2FA request via market_feed API
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    "http://localhost:8000/2fa/create",
+                    json={"bookmaker": self.bookmaker},
+                )
+                data = response.json()
+                request_id = data["request_id"]
+
+            logger.info(f"[{self.bookmaker}] Waiting for 2FA code from Slack (request_id={request_id[:8]})")
+
+            # Poll for the code (5 minute timeout)
+            start_time = time.time()
+            timeout_seconds = 300
+
+            while time.time() - start_time < timeout_seconds:
+                try:
+                    with httpx.Client(timeout=10.0) as client:
+                        response = client.get(f"http://localhost:8000/2fa/check/{request_id}")
+                        data = response.json()
+
+                        if data.get("code"):
+                            logger.info(f"[{self.bookmaker}] Received 2FA code from Slack")
+                            return data["code"]
+
+                        if data.get("status") == "expired":
+                            logger.error(f"[{self.bookmaker}] 2FA request expired")
+                            return None
+
+                except Exception as e:
+                    logger.warning(f"[{self.bookmaker}] Error checking 2FA status: {e}")
+
+                time.sleep(2)
+
+            logger.error(f"[{self.bookmaker}] Timeout waiting for 2FA code from Slack")
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.bookmaker}] Failed to request Slack 2FA code: {e}")
+            return None
 
     def _scrape_odds(self) -> List[MarketOdds]:
         """Scrape odds using configured selectors."""

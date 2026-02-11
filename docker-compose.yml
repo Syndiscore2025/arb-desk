@@ -40,7 +40,7 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -61,7 +61,7 @@ services:
     ports:
       - "127.0.0.1:8002:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -78,7 +78,7 @@ services:
     ports:
       - "127.0.0.1:8003:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -98,7 +98,7 @@ services:
     ports:
       - "127.0.0.1:8004:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -114,15 +114,17 @@ services:
       SERVICE_NAME: slack_notifier
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
       SLACK_DEFAULT_CHANNEL: ${SLACK_DEFAULT_CHANNEL}
       DECISION_GATEWAY_URL: http://decision_gateway:8000
+      MARKET_FEED_URL: http://market_feed:8000
       COMPOSE_PROJECT_NAME: arb-desk
     ports:
       - "127.0.0.1:8005:8000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -137,6 +139,7 @@ services:
     environment:
       SERVICE_NAME: market_feed
       ODDS_INGEST_URL: http://odds_ingest:8000
+      SLACK_NOTIFIER_URL: http://slack_notifier:8000
       FEED_CONFIGS: ${FEED_CONFIGS:-[]}
       BOOKMAKER_CREDENTIALS: ${BOOKMAKER_CREDENTIALS:-{}}
       LOG_DIR: /var/log/arb-desk
@@ -152,7 +155,7 @@ services:
     # Chrome needs shared memory
     shm_size: '2gb'
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3

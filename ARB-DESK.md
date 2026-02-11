@@ -292,10 +292,13 @@ Control ArbDesk services directly from Slack:
 | `arb stop <service>` | Stop a running service |
 | `arb restart <service>` | Restart a service |
 | `arb scrape` | Trigger a market scrape |
+| `arb login` | Start login for all bookmakers |
+| `arb login <bookmaker>` | Start login for specific bookmaker |
 | `arb logs` | View recent logs (last 30 lines) |
 | `arb logs errors` | View only ERROR/CRITICAL logs |
 | `arb logs browser` | View browser-specific logs |
 | `arb logs summary` | View log statistics |
+| `2fa <id> <code>` | Submit 2FA code for pending login |
 
 **Available Services:**
 - `market_feed` - Browser scraping
@@ -453,6 +456,100 @@ When the advisor recommends a cover bet, it suggests:
 - Same-game parlays ($10-20)
 
 These intentional small losses make the account appear recreational.
+
+---
+
+## Slack-Based 2FA (Manual Code Entry)
+
+For sportsbooks that send 2FA codes to your phone via SMS or email, ArbDesk supports a Slack-based 2FA flow. The system pauses login when it detects a 2FA prompt, asks you for the code via Slack, and enters it into the browser.
+
+### How It Works
+
+1. You say `arb login` in Slack
+2. ArbDesk starts logging into your configured sportsbooks
+3. When a sportsbook sends a 2FA code to your phone (SMS/email), the system pauses
+4. ArbDesk sends you a Slack message: "🔐 FanDuel needs a 2FA code. Reply with: `2fa a1b2c3d4 <code>`"
+5. You check your phone, see the SMS (e.g., "Your code is 123456")
+6. You reply in Slack: `2fa a1b2c3d4 123456`
+7. ArbDesk enters the code and completes login
+
+### Configuration
+
+Set `two_factor.method` to `"slack"` in your credentials:
+
+```json
+{
+  "fanduel": {
+    "username": "you@email.com",
+    "password": "yourpassword",
+    "two_factor": {
+      "method": "slack"
+    }
+  },
+  "draftkings": {
+    "username": "you@email.com",
+    "password": "yourpassword",
+    "two_factor": {
+      "method": "slack"
+    }
+  }
+}
+```
+
+### Slack Commands
+
+| Command | Description |
+|---------|-------------|
+| `arb login` | Start login for all configured bookmakers |
+| `arb login fanduel` | Start login for specific bookmaker |
+| `2fa <id> <code>` | Submit 2FA code (e.g., `2fa a1b2c3d4 123456`) |
+
+### Example Flow
+
+```
+You: arb login
+
+Bot: 🔐 Starting login for 2 bookmaker(s)...
+Bot: 🔐 Logging into fanduel...
+Bot: 🔐 Logging into draftkings...
+
+Bot: 🔐 FANDUEL needs a 2FA code.
+     Check your phone for the SMS/email.
+     Reply with: 2fa a1b2c3d4 <code>
+
+[Your phone receives SMS: "Your FanDuel code is 123456"]
+
+You: 2fa a1b2c3d4 123456
+
+Bot: ✅ 2FA code submitted for fanduel
+
+Bot: 🔐 DRAFTKINGS needs a 2FA code.
+     Check your phone for the SMS/email.
+     Reply with: 2fa e5f6g7h8 <code>
+
+[Your phone receives SMS: "Your DraftKings code is 789012"]
+
+You: 2fa e5f6g7h8 789012
+
+Bot: ✅ 2FA code submitted for draftkings
+Bot: ✅ All 2 bookmaker(s) login initiated
+```
+
+### Notes
+
+- Each 2FA request has a unique short ID (first 8 characters of UUID)
+- Multiple bookmakers can request codes simultaneously with different IDs
+- Codes expire after 5 minutes if not submitted
+- The system does NOT generate or receive 2FA codes - it only enters codes you provide
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/2fa/create` | POST | Create a new 2FA request |
+| `/2fa/pending` | GET | List all pending 2FA requests |
+| `/2fa/submit` | POST | Submit a 2FA code |
+| `/2fa/check/{id}` | GET | Check status of a 2FA request |
 
 ---
 

@@ -103,7 +103,7 @@ class SlackNotificationResponse(BaseModel):
 
 class TwoFactorConfig(BaseModel):
     """Configuration for 2FA code retrieval."""
-    method: str  # "totp", "sms", "email"
+    method: str  # "totp", "sms", "email", "slack"
     # For TOTP
     totp_secret: Optional[str] = None
     # For SMS/Email API
@@ -115,6 +115,22 @@ class TwoFactorConfig(BaseModel):
     code_regex: Optional[str] = None  # Regex to extract code from response
     poll_interval_seconds: int = 2  # How often to poll for code
     poll_timeout_seconds: int = 60  # Max time to wait for code
+
+
+class TwoFARequest(BaseModel):
+    """A pending 2FA request waiting for user input via Slack."""
+    request_id: str  # Full UUID
+    bookmaker: str
+    created_at: datetime
+    expires_at: datetime  # 5 minutes from creation
+    status: str = "pending"  # pending, submitted, expired
+
+
+class TwoFASubmission(BaseModel):
+    """A 2FA code submission from Slack."""
+    request_id: str  # Can be short prefix (first 8 chars) or full UUID
+    code: str  # The 2FA code (4-8 digits)
+    submitted_by: str  # Slack user ID
 
 
 class BookmakerCredentials(BaseModel):

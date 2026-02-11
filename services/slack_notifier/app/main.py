@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = os.getenv("SERVICE_NAME", "slack_notifier")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")  # xapp- token for Socket Mode
 DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL")
 MARKET_FEED_URL = os.getenv("MARKET_FEED_URL", "http://market_feed:8000")
 DECISION_GATEWAY_URL = os.getenv("DECISION_GATEWAY_URL", "http://decision_gateway:8000")
@@ -363,6 +366,16 @@ async def handle_slack_events(request: Request) -> Dict:
     text = event.get("text", "")
     user_id = event.get("user", "")
 
+    # Parse 2FA code submission: "2fa <request_id> <code>"
+    twofa_match = re.match(r"2fa\s+(\S+)\s+(\d{4,8})", text, re.IGNORECASE)
+    if twofa_match:
+        request_id_prefix = twofa_match.group(1)
+        code = twofa_match.group(2)
+
+        result = await handle_2fa_submission(request_id_prefix, code, user_id)
+        logger.info(f"2FA submission result: {result}")
+        return {"ok": True}
+
     # Parse bet command: "bet <alert_id> <amount>"
     match = re.match(r"bet\s+(\S+)\s+(\d+(?:\.\d+)?)", text, re.IGNORECASE)
     if match:
@@ -379,9 +392,9 @@ async def handle_slack_events(request: Request) -> Dict:
         logger.info(f"Bet command result: {result}")
         return {"ok": True}
 
-    # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool [service]"
+    # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool|login [service]"
     arb_match = re.match(
-        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool)(?:\s+(\S+))?",
+        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
         text,
         re.IGNORECASE,
     )
@@ -395,6 +408,8 @@ async def handle_slack_events(request: Request) -> Dict:
             result = await handle_heat_command(arg, user_id)
         elif action == "cool":
             result = await handle_cool_command(arg, user_id)
+        elif action == "login":
+            result = await handle_login_command(arg, user_id)
         else:
             result = await handle_service_control(action, arg, user_id)
         logger.info(f"Command result: {result}")
@@ -760,3 +775,295 @@ async def _send_slack_response(message: str, user_id: str) -> None:
                     "mrkdwn": True,
                 },
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slack-Based 2FA Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def handle_2fa_submission(request_id_prefix: str, code: str, user_id: str) -> Dict:
+    """
+    Handle 2FA code submission from Slack.
+
+    User types: 2fa <short_id> <code>
+    We forward the code to market_feed which enters it into the browser.
+    """
+    try:
+        # First, find the full request ID by checking pending requests
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Get pending requests to find the full ID
+            pending_response = await client.get(f"{MARKET_FEED_URL}/2fa/pending")
+            pending_data = pending_response.json()
+
+            # Find matching request
+            full_request_id = None
+            bookmaker = None
+            for req in pending_data.get("pending", []):
+                if (req["request_id"].startswith(request_id_prefix) or
+                    req["short_id"] == request_id_prefix):
+                    full_request_id = req["request_id"]
+                    bookmaker = req["bookmaker"]
+                    break
+
+            if not full_request_id:
+                await _send_slack_response(
+                    f"❌ 2FA request `{request_id_prefix}` not found or expired.",
+                    user_id
+                )
+                return {"success": False, "error": "Request not found"}
+
+            # Submit the code
+            submit_response = await client.post(
+                f"{MARKET_FEED_URL}/2fa/submit",
+                json={
+                    "request_id": full_request_id,
+                    "code": code,
+                    "submitted_by": user_id,
+                },
+            )
+            submit_data = submit_response.json()
+
+            if submit_data.get("success"):
+                await _send_slack_response(
+                    f"✅ 2FA code submitted for *{bookmaker}*",
+                    user_id
+                )
+                return {"success": True, "bookmaker": bookmaker}
+            else:
+                error = submit_data.get("error", "Unknown error")
+                await _send_slack_response(
+                    f"❌ Failed to submit 2FA code: {error}",
+                    user_id
+                )
+                return {"success": False, "error": error}
+
+    except Exception as e:
+        logger.error(f"2FA submission failed: {e}")
+        await _send_slack_response(f"❌ 2FA submission failed: {e}", user_id)
+        return {"success": False, "error": str(e)}
+
+
+async def handle_login_command(bookmaker: Optional[str], user_id: str) -> Dict:
+    """
+    Handle login command from Slack.
+
+    Usage:
+        arb login           - Start login for all configured bookmakers
+        arb login fanduel   - Start login for specific bookmaker
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if bookmaker:
+                # Login to specific bookmaker
+                await _send_slack_response(
+                    f"🔐 Starting login for *{bookmaker}*...",
+                    user_id
+                )
+
+                response = await client.post(
+                    f"{MARKET_FEED_URL}/feeds/control",
+                    json={"bookmaker": bookmaker, "action": "start"},
+                )
+                data = response.json()
+
+                if data.get("success"):
+                    await _send_slack_response(
+                        f"✅ *{bookmaker}* login initiated",
+                        user_id
+                    )
+                else:
+                    await _send_slack_response(
+                        f"❌ *{bookmaker}* login failed: {data.get('message', 'Unknown error')}",
+                        user_id
+                    )
+
+                return data
+            else:
+                # Login to all configured bookmakers
+                feeds_response = await client.get(f"{MARKET_FEED_URL}/feeds")
+                feeds_data = feeds_response.json()
+
+                feeds = feeds_data.get("feeds", [])
+                if not feeds:
+                    await _send_slack_response(
+                        "❌ No feeds configured. Check FEED_CONFIGS environment variable.",
+                        user_id
+                    )
+                    return {"success": False, "error": "No feeds configured"}
+
+                await _send_slack_response(
+                    f"🔐 Starting login for {len(feeds)} bookmaker(s)...",
+                    user_id
+                )
+
+                results = []
+                for feed in feeds:
+                    bm = feed.get("bookmaker")
+                    if not bm:
+                        continue
+
+                    await _send_slack_response(
+                        f"🔐 Logging into *{bm}*...",
+                        user_id
+                    )
+
+                    try:
+                        response = await client.post(
+                            f"{MARKET_FEED_URL}/feeds/control",
+                            json={"bookmaker": bm, "action": "start"},
+                        )
+                        data = response.json()
+                        results.append({"bookmaker": bm, **data})
+                    except Exception as e:
+                        results.append({"bookmaker": bm, "success": False, "error": str(e)})
+
+                # Summary
+                success_count = sum(1 for r in results if r.get("success"))
+                total_count = len(results)
+
+                if success_count == total_count:
+                    await _send_slack_response(
+                        f"✅ All {total_count} bookmaker(s) login initiated",
+                        user_id
+                    )
+                else:
+                    await _send_slack_response(
+                        f"⚠️ {success_count}/{total_count} bookmaker(s) login initiated",
+                        user_id
+                    )
+
+                return {"success": success_count > 0, "results": results}
+
+    except Exception as e:
+        logger.error(f"Login command failed: {e}")
+        await _send_slack_response(f"❌ Login failed: {e}", user_id)
+        return {"success": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slack Socket Mode Listener
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _process_message_sync(text: str, user_id: str, channel: str) -> None:
+    """Process a Slack message synchronously (runs in Socket Mode thread)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_process_message_async(text, user_id, channel))
+    finally:
+        loop.close()
+
+
+async def _process_message_async(text: str, user_id: str, channel: str) -> None:
+    """Process a Slack message - same logic as handle_slack_events."""
+    # Parse 2FA code submission: "2fa <request_id> <code>"
+    twofa_match = re.match(r"2fa\s+(\S+)\s+(\d{4,8})", text, re.IGNORECASE)
+    if twofa_match:
+        request_id_prefix = twofa_match.group(1)
+        code = twofa_match.group(2)
+        result = await handle_2fa_submission(request_id_prefix, code, user_id)
+        logger.info(f"2FA submission result: {result}")
+        return
+
+    # Parse bet command: "bet <alert_id> <amount>"
+    match = re.match(r"bet\s+(\S+)\s+(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    if match:
+        alert_id = match.group(1)
+        stake_amount = float(match.group(2))
+        command = BetCommand(
+            alert_id=alert_id,
+            stake_amount=stake_amount,
+            user_id=user_id,
+        )
+        result = await handle_bet_command(command)
+        logger.info(f"Bet command result: {result}")
+        return
+
+    # Parse service control commands
+    arb_match = re.match(
+        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
+        text,
+        re.IGNORECASE,
+    )
+    if arb_match:
+        action = arb_match.group(1).lower()
+        arg = arb_match.group(2)
+
+        if action == "logs":
+            result = await handle_logs_command(arg, user_id)
+        elif action == "heat":
+            result = await handle_heat_command(arg, user_id)
+        elif action == "cool":
+            result = await handle_cool_command(arg, user_id)
+        elif action == "login":
+            result = await handle_login_command(arg, user_id)
+        else:
+            result = await handle_service_control(action, arg, user_id)
+        logger.info(f"Socket Mode command result: {result}")
+        return
+
+    # Unknown command - send help
+    if text.lower().startswith("arb") or text.lower().startswith("bet") or text.lower().startswith("2fa"):
+        await _send_slack_response(
+            "❓ Unknown command. Available commands:\n"
+            "• `arb status` - Service status\n"
+            "• `arb login [bookmaker]` - Login to bookmakers\n"
+            "• `arb scrape` - Trigger scrape\n"
+            "• `arb logs [errors|browser|summary]` - View logs\n"
+            "• `arb heat [bookmaker]` - View heat scores\n"
+            "• `arb cool <bookmaker>` - Force cooling\n"
+            "• `arb start|stop|restart <service>` - Control services\n"
+            "• `bet <alert_id> <amount>` - Place a bet\n"
+            "• `2fa <id> <code>` - Submit 2FA code",
+            user_id,
+        )
+
+
+def _start_socket_mode() -> None:
+    """Start Slack Socket Mode listener in a background thread."""
+    if not SLACK_APP_TOKEN or not SLACK_BOT_TOKEN:
+        logger.warning(
+            "Socket Mode disabled: SLACK_APP_TOKEN or SLACK_BOT_TOKEN not set. "
+            "Bot can send messages but cannot receive commands from Slack."
+        )
+        return
+
+    try:
+        from slack_bolt import App
+        from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+        bolt_app = App(token=SLACK_BOT_TOKEN)
+
+        @bolt_app.event("message")
+        def handle_message_event(event, say):
+            """Handle all message events from Slack."""
+            # Ignore bot messages
+            if event.get("bot_id") or event.get("subtype"):
+                return
+
+            text = event.get("text", "").strip()
+            user_id = event.get("user", "")
+            channel = event.get("channel", "")
+
+            if not text:
+                return
+
+            logger.info(f"Socket Mode received: '{text}' from user {user_id}")
+            _process_message_sync(text, user_id, channel)
+
+        handler = SocketModeHandler(bolt_app, SLACK_APP_TOKEN)
+        logger.info("🔌 Starting Slack Socket Mode listener...")
+        handler.start()  # This blocks, so it must run in a thread
+
+    except Exception as e:
+        logger.error(f"Failed to start Socket Mode: {e}")
+
+
+@app.on_event("startup")
+def startup_socket_mode():
+    """Start Socket Mode listener when FastAPI starts."""
+    thread = threading.Thread(target=_start_socket_mode, daemon=True)
+    thread.start()
+    logger.info("Socket Mode thread launched")
