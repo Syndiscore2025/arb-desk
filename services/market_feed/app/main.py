@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -55,6 +56,18 @@ BOOKMAKER_CREDENTIALS_JSON = os.getenv("BOOKMAKER_CREDENTIALS", "{}")
 _pending_2fa_requests: Dict[str, TwoFARequest] = {}
 _submitted_2fa_codes: Dict[str, str] = {}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-Polling State
+# ─────────────────────────────────────────────────────────────────────────────
+_poller_tasks: Dict[str, asyncio.Task] = {}   # bookmaker -> background Task
+_poller_stats: Dict[str, Dict] = {}           # bookmaker -> runtime stats
+
+# Randomized polling bounds (seconds)
+POLL_MIN_INTERVAL = int(os.getenv("POLL_MIN_INTERVAL", "45"))
+POLL_MAX_INTERVAL = int(os.getenv("POLL_MAX_INTERVAL", "90"))
+# Stagger offset so bookmakers don't start at the same instant
+POLL_STAGGER_MAX = int(os.getenv("POLL_STAGGER_MAX", "30"))
+
 app = FastAPI(title="Market Feed", version="0.1.0")
 
 
@@ -81,28 +94,163 @@ def _load_credentials() -> Dict[str, BookmakerCredentials]:
         return {}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-Polling Background Loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _auto_poll_loop(bookmaker: str) -> None:
+    """
+    Continuous background polling loop for a single bookmaker.
+
+    Uses randomized intervals between POLL_MIN_INTERVAL and POLL_MAX_INTERVAL
+    so that requests don't follow a fixed cadence (anti-detection).
+    Each bookmaker runs its own independent loop with different timing.
+    """
+    _poller_stats[bookmaker] = {
+        "started_at": datetime.utcnow().isoformat(),
+        "poll_count": 0,
+        "success_count": 0,
+        "error_count": 0,
+        "last_poll_at": None,
+        "last_error": None,
+        "next_delay": None,
+    }
+
+    # Stagger start — each bookmaker waits a random offset so they
+    # don't hit their respective sites at the same second.
+    stagger = random.uniform(5, POLL_STAGGER_MAX)
+    logger.info(f"[{bookmaker}] Auto-poller starting in {stagger:.1f}s (staggered)")
+    await asyncio.sleep(stagger)
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+    BASE_ERROR_BACKOFF = 30  # seconds
+
+    while True:
+        poll_start = datetime.utcnow()
+        _poller_stats[bookmaker]["poll_count"] += 1
+        _poller_stats[bookmaker]["last_poll_at"] = poll_start.isoformat()
+
+        try:
+            # Ensure logged in first
+            logged_in = session_manager.ensure_logged_in(bookmaker)
+            if not logged_in:
+                logger.warning(f"[{bookmaker}] Not logged in — skipping poll cycle")
+                _poller_stats[bookmaker]["error_count"] += 1
+                _poller_stats[bookmaker]["last_error"] = "not_logged_in"
+                consecutive_errors += 1
+            else:
+                # Scrape
+                adapter = session_manager.get_adapter(bookmaker)
+                if adapter is None:
+                    raise RuntimeError("Adapter not available")
+
+                result: ScrapeResult = adapter.scrape()
+
+                if not result.success:
+                    raise RuntimeError(result.error or "scrape failed")
+
+                # Push odds to odds_ingest (triggers arb_math → decision_gateway → slack)
+                if result.odds:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            f"{ODDS_INGEST_URL}/process",
+                            json=[o.model_dump(mode="json") for o in result.odds],
+                        )
+                        resp.raise_for_status()
+                    logger.info(
+                        f"[{bookmaker}] Auto-poll OK — "
+                        f"{len(result.odds)} odds pushed to pipeline"
+                    )
+                else:
+                    logger.info(f"[{bookmaker}] Auto-poll OK — 0 odds (empty scrape)")
+
+                _poller_stats[bookmaker]["success_count"] += 1
+                consecutive_errors = 0  # reset on success
+
+        except asyncio.CancelledError:
+            logger.info(f"[{bookmaker}] Auto-poller cancelled")
+            return
+        except Exception as exc:
+            consecutive_errors += 1
+            _poller_stats[bookmaker]["error_count"] += 1
+            _poller_stats[bookmaker]["last_error"] = str(exc)[:200]
+            logger.error(f"[{bookmaker}] Auto-poll error ({consecutive_errors}): {exc}")
+
+        # --- Determine next sleep ---
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            # Exponential-ish back-off capped at 10 minutes
+            backoff = min(BASE_ERROR_BACKOFF * (2 ** (consecutive_errors - MAX_CONSECUTIVE_ERRORS)), 600)
+            delay = backoff + random.uniform(0, 30)
+            logger.warning(
+                f"[{bookmaker}] {consecutive_errors} consecutive errors — "
+                f"backing off {delay:.0f}s"
+            )
+        else:
+            # Normal randomized interval
+            delay = random.uniform(POLL_MIN_INTERVAL, POLL_MAX_INTERVAL)
+
+        _poller_stats[bookmaker]["next_delay"] = round(delay, 1)
+        logger.debug(f"[{bookmaker}] Next poll in {delay:.1f}s")
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            logger.info(f"[{bookmaker}] Auto-poller cancelled during sleep")
+            return
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize feeds on startup."""
+    """Initialize feeds and start auto-polling loops on startup."""
     logger.info("Market Feed service starting...")
-    
+
     configs = _load_feed_configs()
     credentials = _load_credentials()
-    
+
     for config in configs:
         if config.bookmaker in credentials:
             session_manager.register_feed(config, credentials[config.bookmaker])
             logger.info(f"Registered feed: {config.bookmaker}")
         else:
             logger.warning(f"No credentials for {config.bookmaker}, skipping")
-    
+
     logger.info(f"Initialized {len(session_manager._configs)} feeds")
+
+    # Launch auto-pollers for every enabled bookmaker
+    for bookmaker, config in session_manager._configs.items():
+        if not config.enabled:
+            logger.info(f"[{bookmaker}] Feed disabled — skipping auto-poller")
+            continue
+        task = asyncio.create_task(
+            _auto_poll_loop(bookmaker),
+            name=f"auto_poll_{bookmaker}",
+        )
+        _poller_tasks[bookmaker] = task
+        logger.info(
+            f"[{bookmaker}] Auto-poller scheduled "
+            f"(interval {POLL_MIN_INTERVAL}-{POLL_MAX_INTERVAL}s randomized)"
+        )
+
+    if _poller_tasks:
+        logger.info(
+            f"🚀 {len(_poller_tasks)} auto-pollers launched — "
+            f"arb detection is fully automated"
+        )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up on shutdown."""
+    """Cancel pollers and clean up on shutdown."""
     logger.info("Market Feed service shutting down...")
+
+    # Cancel all background pollers
+    for bookmaker, task in _poller_tasks.items():
+        if not task.done():
+            task.cancel()
+            logger.info(f"[{bookmaker}] Auto-poller cancelled")
+    _poller_tasks.clear()
+
     session_manager.close_all()
 
 
@@ -179,6 +327,58 @@ def control_feed(request: FeedControlRequest) -> FeedControlResponse:
             success=False,
             message=str(e),
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Polling Status & Control
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/polling/status")
+def polling_status() -> Dict:
+    """Get status of all auto-polling background loops."""
+    pollers = {}
+    for bookmaker, task in _poller_tasks.items():
+        stats = _poller_stats.get(bookmaker, {})
+        pollers[bookmaker] = {
+            "running": not task.done(),
+            "interval_range": f"{POLL_MIN_INTERVAL}-{POLL_MAX_INTERVAL}s (randomized)",
+            **stats,
+        }
+    return {
+        "auto_polling_enabled": bool(_poller_tasks),
+        "active_pollers": sum(1 for t in _poller_tasks.values() if not t.done()),
+        "total_pollers": len(_poller_tasks),
+        "pollers": pollers,
+    }
+
+
+@app.post("/polling/stop/{bookmaker}")
+def stop_poller(bookmaker: str) -> Dict:
+    """Stop the auto-poller for a specific bookmaker."""
+    task = _poller_tasks.get(bookmaker)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"No poller for {bookmaker}")
+    if task.done():
+        return {"bookmaker": bookmaker, "message": "Poller already stopped"}
+    task.cancel()
+    return {"bookmaker": bookmaker, "message": "Poller stop requested"}
+
+
+@app.post("/polling/start/{bookmaker}")
+def start_poller(bookmaker: str) -> Dict:
+    """Start (or restart) the auto-poller for a specific bookmaker."""
+    if bookmaker not in session_manager._configs:
+        raise HTTPException(status_code=404, detail=f"Feed not found: {bookmaker}")
+    # Cancel existing if any
+    existing = _poller_tasks.get(bookmaker)
+    if existing and not existing.done():
+        existing.cancel()
+    task = asyncio.create_task(
+        _auto_poll_loop(bookmaker),
+        name=f"auto_poll_{bookmaker}",
+    )
+    _poller_tasks[bookmaker] = task
+    return {"bookmaker": bookmaker, "message": "Poller started"}
 
 
 @app.post("/scrape/{bookmaker}", response_model=ScrapeResult)
@@ -691,3 +891,126 @@ async def wait_for_2fa_code(request_id: str, timeout_seconds: int = 300) -> Opti
         _pending_2fa_requests.pop(request_id, None)
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cookie-Based Session Import
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory cookie store (persisted to disk)
+COOKIE_DIR = Path(os.getenv("COOKIE_DIR", "/tmp/arb-desk-cookies"))
+COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+
+_imported_cookies: Dict[str, List[Dict]] = {}
+
+
+def _load_cookies_from_disk() -> None:
+    """Load saved cookies from disk on startup."""
+    global _imported_cookies
+    for cookie_file in COOKIE_DIR.glob("*.json"):
+        bookmaker = cookie_file.stem
+        try:
+            with open(cookie_file, "r") as f:
+                _imported_cookies[bookmaker] = json.load(f)
+            logger.info(f"[{bookmaker}] Loaded {len(_imported_cookies[bookmaker])} cookies from disk")
+        except Exception as e:
+            logger.warning(f"[{bookmaker}] Failed to load cookies: {e}")
+
+
+def _save_cookies_to_disk(bookmaker: str, cookies: List[Dict]) -> None:
+    """Save cookies to disk for persistence across restarts."""
+    cookie_file = COOKIE_DIR / f"{bookmaker}.json"
+    try:
+        with open(cookie_file, "w") as f:
+            json.dump(cookies, f)
+        logger.info(f"[{bookmaker}] Saved {len(cookies)} cookies to disk")
+    except Exception as e:
+        logger.warning(f"[{bookmaker}] Failed to save cookies: {e}")
+
+
+def get_imported_cookies(bookmaker: str) -> Optional[List[Dict]]:
+    """Get imported cookies for a bookmaker."""
+    return _imported_cookies.get(bookmaker.lower())
+
+
+@app.post("/cookies/import/{bookmaker}")
+async def import_cookies(bookmaker: str, cookies: List[Dict]) -> Dict:
+    """
+    Import browser cookies for a bookmaker.
+
+    This allows you to log in manually in your browser, export cookies,
+    and import them here so the scraper can use your authenticated session.
+
+    Expected cookie format (from browser):
+    [
+        {"name": "cookie_name", "value": "cookie_value", "domain": ".fanduel.com", ...},
+        ...
+    ]
+    """
+    bookmaker = bookmaker.lower()
+
+    if bookmaker not in session_manager._configs:
+        raise HTTPException(status_code=404, detail=f"Unknown bookmaker: {bookmaker}")
+
+    if not cookies:
+        raise HTTPException(status_code=400, detail="No cookies provided")
+
+    # Store cookies
+    _imported_cookies[bookmaker] = cookies
+    _save_cookies_to_disk(bookmaker, cookies)
+
+    # Mark session as valid (we'll use cookies instead of login)
+    adapter = session_manager.get_adapter(bookmaker)
+    if adapter:
+        adapter.session_status.logged_in = True
+        adapter.session_status.session_valid = True
+        adapter.session_status.last_login_at = datetime.utcnow()
+        adapter.session_status.login_failures = 0
+        adapter.session_status.error = None
+
+    logger.info(f"[{bookmaker}] Imported {len(cookies)} cookies — session marked as valid")
+
+    return {
+        "success": True,
+        "bookmaker": bookmaker,
+        "cookies_imported": len(cookies),
+        "message": f"Session cookies imported. {bookmaker} is now authenticated.",
+    }
+
+
+@app.get("/cookies/status")
+async def cookies_status() -> Dict:
+    """Check which bookmakers have imported cookies."""
+    status = {}
+    for bookmaker in session_manager._configs.keys():
+        cookies = _imported_cookies.get(bookmaker, [])
+        status[bookmaker] = {
+            "has_cookies": len(cookies) > 0,
+            "cookie_count": len(cookies),
+            "cookie_file_exists": (COOKIE_DIR / f"{bookmaker}.json").exists(),
+        }
+    return status
+
+
+@app.delete("/cookies/{bookmaker}")
+async def clear_cookies(bookmaker: str) -> Dict:
+    """Clear imported cookies for a bookmaker."""
+    bookmaker = bookmaker.lower()
+
+    _imported_cookies.pop(bookmaker, None)
+
+    cookie_file = COOKIE_DIR / f"{bookmaker}.json"
+    if cookie_file.exists():
+        cookie_file.unlink()
+
+    # Invalidate session
+    adapter = session_manager.get_adapter(bookmaker)
+    if adapter:
+        adapter.session_status.logged_in = False
+        adapter.session_status.session_valid = False
+
+    return {"success": True, "bookmaker": bookmaker, "message": "Cookies cleared"}
+
+
+# Load cookies on module import
+_load_cookies_from_disk()

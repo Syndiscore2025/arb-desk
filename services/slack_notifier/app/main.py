@@ -50,6 +50,17 @@ CONTROLLABLE_SERVICES = [
     "browser_shadow",
 ]
 
+# Service health-check URLs (reachable inside Docker network)
+SERVICE_HEALTH_URLS = {
+    "odds_ingest": "http://odds_ingest:8000/health",
+    "arb_math": "http://arb_math:8000/health",
+    "browser_shadow": "http://browser_shadow:8000/health",
+    "decision_gateway": "http://decision_gateway:8000/health",
+    "slack_notifier": "http://localhost:8000/health",
+    "market_feed": "http://market_feed:8000/health",
+    "postgres": "http://odds_ingest:8000/health",  # proxy: if odds_ingest is up, postgres is up
+}
+
 # In-memory store for pending alerts (for bet command matching)
 # In production, use Redis or database
 _pending_alerts: Dict[str, ArbAlert] = {}
@@ -549,31 +560,43 @@ def _get_all_containers() -> Dict[str, dict]:
     return result
 
 
+async def _check_service_health(service_name: str, url: str) -> tuple:
+    """Check a single service's health via HTTP. Returns (name, status, detail)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                return (service_name, "running", data.get("time_utc", ""))
+            else:
+                return (service_name, "unhealthy", f"HTTP {response.status_code}")
+    except Exception:
+        return (service_name, "down", "unreachable")
+
+
 async def handle_service_control(action: str, service: Optional[str], user_id: str) -> Dict:
     """Handle service control commands from Slack."""
 
-    if not docker_client:
-        msg = "❌ Docker control unavailable. Docker socket not mounted."
-        notify(SlackNotification(message=msg))
-        return {"success": False, "message": msg}
-
-    # Status command - show all services
+    # Status command - uses HTTP health checks (no Docker socket needed)
     if action == "status":
-        containers = _get_all_containers()
-        if not containers:
-            msg = "❌ No ArbDesk containers found."
-        else:
-            lines = ["📊 *ArbDesk Service Status*", ""]
-            for svc, info in sorted(containers.items()):
-                status = info["status"]
-                if status == "running":
-                    emoji = "🟢"
-                elif status == "exited":
-                    emoji = "🔴"
-                else:
-                    emoji = "🟡"
-                lines.append(f"{emoji} *{svc}*: {status}")
-            msg = "\n".join(lines)
+        import asyncio
+        tasks = [
+            _check_service_health(svc, url)
+            for svc, url in sorted(SERVICE_HEALTH_URLS.items())
+            if svc != "postgres"  # skip proxy check
+        ]
+        results = await asyncio.gather(*tasks)
+
+        lines = ["📊 *ArbDesk Service Status*", ""]
+        for svc, status, detail in sorted(results, key=lambda x: x[0]):
+            if status == "running":
+                emoji = "🟢"
+            elif status == "unhealthy":
+                emoji = "🟡"
+            else:
+                emoji = "🔴"
+            lines.append(f"{emoji} *{svc}*: {status}")
+        msg = "\n".join(lines)
 
         notify(SlackNotification(message=msg))
         return {"success": True, "message": msg}
@@ -591,42 +614,54 @@ async def handle_service_control(action: str, service: Optional[str], user_id: s
         notify(SlackNotification(message=msg))
         return {"success": True, "message": msg}
 
-    # Service-specific commands
-    if not service:
-        msg = f"❌ Please specify a service: `arb {action} <service>`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
+    # Start/stop/restart require Docker socket
+    if action in ("start", "stop", "restart"):
+        if not docker_client:
+            msg = (
+                f"❌ `arb {action}` requires Docker socket access (not available on Windows Docker Desktop).\n"
+                f"Use Docker Desktop or run `docker compose restart {service or '<service>'}` from your terminal instead."
+            )
+            notify(SlackNotification(message=msg))
+            return {"success": False, "message": msg}
+
+        if not service:
+            msg = f"❌ Please specify a service: `arb {action} <service>`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
+            notify(SlackNotification(message=msg))
+            return {"success": False, "message": msg}
+
+        service = service.lower()
+        if service not in CONTROLLABLE_SERVICES:
+            msg = f"❌ Unknown service: `{service}`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
+            notify(SlackNotification(message=msg))
+            return {"success": False, "message": msg}
+
+        container = _get_container(service)
+        if not container:
+            msg = f"❌ Container for `{service}` not found."
+            notify(SlackNotification(message=msg))
+            return {"success": False, "message": msg}
+
+        try:
+            if action == "start":
+                container.start()
+                msg = f"✅ Started `{service}`"
+            elif action == "stop":
+                container.stop(timeout=10)
+                msg = f"🛑 Stopped `{service}`"
+            elif action == "restart":
+                container.restart(timeout=10)
+                msg = f"🔄 Restarted `{service}`"
+            else:
+                msg = f"❌ Unknown action: `{action}`"
+        except Exception as e:
+            msg = f"❌ Failed to {action} `{service}`: {str(e)}"
+
         notify(SlackNotification(message=msg))
-        return {"success": False, "message": msg}
+        return {"success": True, "message": msg}
 
-    service = service.lower()
-    if service not in CONTROLLABLE_SERVICES:
-        msg = f"❌ Unknown service: `{service}`\n\nAvailable: {', '.join(CONTROLLABLE_SERVICES)}"
-        notify(SlackNotification(message=msg))
-        return {"success": False, "message": msg}
-
-    container = _get_container(service)
-    if not container:
-        msg = f"❌ Container for `{service}` not found."
-        notify(SlackNotification(message=msg))
-        return {"success": False, "message": msg}
-
-    try:
-        if action == "start":
-            container.start()
-            msg = f"✅ Started `{service}`"
-        elif action == "stop":
-            container.stop(timeout=10)
-            msg = f"🛑 Stopped `{service}`"
-        elif action == "restart":
-            container.restart(timeout=10)
-            msg = f"🔄 Restarted `{service}`"
-        else:
-            msg = f"❌ Unknown action: `{action}`"
-
-    except Exception as e:
-        msg = f"❌ Failed to {action} `{service}`: {str(e)}"
-
+    msg = f"❌ Unknown action: `{action}`"
     notify(SlackNotification(message=msg))
-    return {"success": True, "message": msg}
+    return {"success": False, "message": msg}
 
 
 @app.get("/services/status")

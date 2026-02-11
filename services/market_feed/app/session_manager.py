@@ -1,14 +1,21 @@
 """
 Session manager for handling browser sessions across multiple sportsbooks.
 Manages login, session persistence, and auto-relogin on expiration.
+
+Supports two modes:
+1. Cookie-based: User logs in manually, exports cookies, imports via API
+2. Browser automation: Selenium/Playwright (currently broken on Windows Docker)
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from shared.schemas import BookmakerCredentials, FeedConfig, FeedStatus, SessionStatus
 from .adapters.base import BaseFeedAdapter
@@ -16,6 +23,10 @@ from .adapters.generic import GenericSportsbookAdapter
 
 logger = logging.getLogger(__name__)
 browser_logger = logging.getLogger("market_feed.browser.session")
+
+# Cookie storage directory
+COOKIE_DIR = Path(os.getenv("COOKIE_DIR", "/tmp/arb-desk-cookies"))
+COOKIE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class SessionManager:
@@ -84,10 +95,32 @@ class SessionManager:
         # In the future, could use a factory pattern for specific adapters
         return GenericSportsbookAdapter(config, credentials)
     
+    def _has_imported_cookies(self, bookmaker: str) -> bool:
+        """Check if we have imported cookies for this bookmaker."""
+        cookie_file = COOKIE_DIR / f"{bookmaker.lower()}.json"
+        return cookie_file.exists()
+
+    def _load_imported_cookies(self, bookmaker: str) -> Optional[List[Dict]]:
+        """Load imported cookies from disk."""
+        cookie_file = COOKIE_DIR / f"{bookmaker.lower()}.json"
+        if not cookie_file.exists():
+            return None
+        try:
+            with open(cookie_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[{bookmaker}] Failed to load cookies: {e}")
+            return None
+
     def ensure_logged_in(self, bookmaker: str) -> bool:
         """
         Ensure the adapter is logged in, attempting login if needed.
         Returns True if logged in, False otherwise.
+
+        Priority:
+        1. Check if session is already valid
+        2. Check for imported cookies (cookie-based auth)
+        3. Fall back to browser automation (may fail on Windows Docker)
         """
         adapter = self.get_adapter(bookmaker)
         if not adapter:
@@ -104,6 +137,23 @@ class SessionManager:
                 extra={"event_type": "session_valid", "bookmaker": bookmaker}
             )
             return True
+
+        # Check for imported cookies — if present, mark session as valid
+        if self._has_imported_cookies(bookmaker):
+            cookies = self._load_imported_cookies(bookmaker)
+            if cookies:
+                browser_logger.info(
+                    f"Using imported cookies for {bookmaker} ({len(cookies)} cookies)",
+                    extra={"event_type": "cookie_auth", "bookmaker": bookmaker}
+                )
+                adapter.session_status.logged_in = True
+                adapter.session_status.session_valid = True
+                adapter.session_status.last_login_at = datetime.utcnow()
+                adapter.session_status.login_failures = 0
+                adapter.session_status.error = None
+                # Store cookies on adapter for use in scraping
+                adapter._imported_cookies = cookies
+                return True
 
         # Check if we can attempt login (rate limiting)
         if not self._can_attempt_login(bookmaker):
@@ -125,9 +175,9 @@ class SessionManager:
             )
             return False
 
-        # Attempt login
+        # Attempt browser-based login (may fail on Windows Docker)
         browser_logger.info(
-            f"Attempting login for {bookmaker}",
+            f"Attempting browser login for {bookmaker}",
             extra={"event_type": "login_attempt", "bookmaker": bookmaker}
         )
         self._last_login_attempt[bookmaker] = datetime.utcnow()
@@ -147,7 +197,7 @@ class SessionManager:
             )
         else:
             browser_logger.error(
-                f"Login failed for {bookmaker}",
+                f"Login failed for {bookmaker}. Import cookies via /cookies/import/{bookmaker}",
                 extra={
                     "event_type": "login_failed",
                     "bookmaker": bookmaker,
