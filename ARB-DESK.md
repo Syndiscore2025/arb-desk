@@ -1,4 +1,4 @@
-# ArbDesk - Sports Betting Arbitrage System
+![alt text](image.png)# ArbDesk - Sports Betting Arbitrage System
 
 **ArbDesk** is an automated sports betting arbitrage detection and execution system. It continuously scrapes odds from multiple sportsbooks, detects arbitrage opportunities (where you can bet on all outcomes and guarantee profit), alerts you via Slack, and can place bets automatically.
 
@@ -222,6 +222,15 @@ curl http://localhost:8006/health  # market_feed
 | `/scrape/{bookmaker}` | POST | Trigger scrape for specific book |
 | `/scrape-all` | POST | Trigger scrape for all enabled feeds |
 | `/bet/place` | POST | Place a bet via browser automation |
+| `/login/visual/{bookmaker}` | POST | Open visible browser for manual login |
+| `/login/status` | GET | Check saved session status |
+| `/odds-api/odds` | GET | Fetch pre-game odds from The Odds API |
+| `/odds-api/live` | GET | Fetch live odds from The Odds API (delayed) |
+| `/odds-api/status` | GET | Check Odds API key configuration |
+| `/odds-api/fetch-and-push` | POST | Fetch from Odds API and push to pipeline |
+| `/live/status` | GET | Check login status for live interception |
+| `/live/scrape/{bookmaker}` | POST | Scrape live odds via API interception |
+| `/live/scrape-and-push/{bookmaker}` | POST | Scrape live and push to pipeline |
 
 ### Arb Math API (Port 8002)
 
