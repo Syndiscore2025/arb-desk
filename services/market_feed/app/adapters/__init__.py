@@ -26,6 +26,12 @@ from .prediction_markets import (
 # Offshore/sharp book adapters
 from .pinnacle_adapter import PinnacleAdapter, CLVCalculator
 
+# Third-party odds API (pre-game odds, no browser needed)
+from .odds_api_adapter import OddsAPIAdapter
+
+# API interception adapter (real-time live odds)
+from .intercepting_adapter import InterceptingAdapter
+
 __all__ = [
     "BaseFeedAdapter",
     "GenericSportsbookAdapter",
@@ -44,5 +50,9 @@ __all__ = [
     # Offshore/sharp
     "PinnacleAdapter",
     "CLVCalculator",
+    # Third-party odds API
+    "OddsAPIAdapter",
+    # API interception (live odds)
+    "InterceptingAdapter",
 ]
 

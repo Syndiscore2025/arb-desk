@@ -493,6 +493,439 @@ def register_feed(config: FeedConfig, credentials: BookmakerCredentials) -> Feed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# The Odds API Integration (Pre-game odds, no browser needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .adapters.odds_api_adapter import OddsAPIAdapter
+
+# Singleton adapter instance
+_odds_api_adapter: Optional[OddsAPIAdapter] = None
+
+
+def _get_odds_api_adapter() -> OddsAPIAdapter:
+    """Get or create the Odds API adapter singleton."""
+    global _odds_api_adapter
+    if _odds_api_adapter is None:
+        _odds_api_adapter = OddsAPIAdapter()
+    return _odds_api_adapter
+
+
+@app.get("/odds-api/odds")
+async def get_odds_api_odds(
+    sports: Optional[str] = None,
+    bookmakers: Optional[str] = None,
+    markets: Optional[str] = None,
+) -> ScrapeResult:
+    """
+    Fetch pre-game odds from The Odds API.
+
+    This is the recommended way to get pre-game odds - no login required,
+    no browser automation, no anti-bot issues.
+
+    Args:
+        sports: Comma-separated sports (e.g., "nfl,nba"). Default: all major sports.
+        bookmakers: Comma-separated bookmakers. Default: fanduel,draftkings,fanatics.
+        markets: Comma-separated markets. Default: h2h,spreads,totals.
+
+    Returns:
+        ScrapeResult with normalized MarketOdds from all requested bookmakers.
+    """
+    adapter = _get_odds_api_adapter()
+
+    sport_list = sports.split(",") if sports else None
+    book_list = bookmakers.split(",") if bookmakers else None
+    market_list = markets.split(",") if markets else None
+
+    return adapter.get_odds(
+        sports=sport_list,
+        bookmakers=book_list,
+        markets=market_list,
+    )
+
+
+@app.get("/odds-api/live")
+async def get_odds_api_live(
+    sports: Optional[str] = None,
+    bookmakers: Optional[str] = None,
+) -> ScrapeResult:
+    """
+    Fetch live/in-play odds from The Odds API.
+
+    NOTE: Live odds from The Odds API have 5-30 second delay.
+    For true real-time live odds, use the intercepting adapter (requires login).
+
+    Args:
+        sports: Comma-separated sports. Default: all major sports.
+        bookmakers: Comma-separated bookmakers. Default: CT legal books.
+    """
+    adapter = _get_odds_api_adapter()
+
+    sport_list = sports.split(",") if sports else None
+    book_list = bookmakers.split(",") if bookmakers else None
+
+    return adapter.get_live_odds(
+        sports=sport_list,
+        bookmakers=book_list,
+    )
+
+
+@app.get("/odds-api/status")
+async def odds_api_status() -> Dict:
+    """Check Odds API status and rate limit info."""
+    adapter = _get_odds_api_adapter()
+
+    api_key_configured = bool(adapter.api_key)
+
+    return {
+        "configured": api_key_configured,
+        "requests_remaining": adapter.requests_remaining,
+        "message": "ODDS_API_KEY is set" if api_key_configured else "ODDS_API_KEY not configured - set in .env",
+    }
+
+
+@app.post("/odds-api/fetch-and-push")
+async def odds_api_fetch_and_push(
+    sports: Optional[str] = None,
+    bookmakers: Optional[str] = None,
+) -> Dict:
+    """
+    Fetch odds from The Odds API and push to odds_ingest for arb detection.
+
+    This is the main endpoint for automated pre-game arb detection using
+    the third-party API (no browser scraping).
+    """
+    adapter = _get_odds_api_adapter()
+
+    sport_list = sports.split(",") if sports else None
+    book_list = bookmakers.split(",") if bookmakers else None
+
+    result = adapter.get_odds(sports=sport_list, bookmakers=book_list)
+
+    if not result.success:
+        return {"success": False, "error": result.error}
+
+    if not result.odds:
+        return {"success": True, "message": "No odds available", "count": 0}
+
+    # Push to odds_ingest
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ODDS_INGEST_URL}/process",
+                json=[odds.model_dump(mode="json") for odds in result.odds],
+            )
+            response.raise_for_status()
+
+        logger.info(f"[odds_api] Pushed {len(result.odds)} odds to pipeline")
+
+        return {
+            "success": True,
+            "odds_count": len(result.odds),
+            "requests_remaining": adapter.requests_remaining,
+            "message": f"Fetched and pushed {len(result.odds)} odds from The Odds API",
+        }
+    except Exception as e:
+        logger.error(f"[odds_api] Failed to push to odds_ingest: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Odds via API Interception (Real-time, requires login)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/live/status")
+async def live_interception_status() -> Dict:
+    """
+    Check which bookmakers are ready for live odds interception.
+
+    Returns login status for each CT sportsbook. Live interception requires
+    an active login session (via browser automation or imported cookies).
+    """
+    ct_books = ["fanduel", "draftkings", "fanatics"]
+    status = {}
+
+    for bookmaker in ct_books:
+        adapter = session_manager.get_adapter(bookmaker)
+        if adapter:
+            status[bookmaker] = {
+                "configured": True,
+                "logged_in": adapter.session_status.logged_in,
+                "session_valid": adapter.session_status.session_valid,
+                "adapter_type": type(adapter).__name__,
+            }
+        else:
+            config_exists = bookmaker in session_manager._configs
+            status[bookmaker] = {
+                "configured": config_exists,
+                "logged_in": False,
+                "session_valid": False,
+                "adapter_type": None,
+            }
+
+    return {
+        "ready": any(s.get("session_valid") for s in status.values()),
+        "bookmakers": status,
+        "message": "Use POST /live/scrape/{bookmaker} to fetch live odds via API interception",
+    }
+
+
+@app.post("/live/scrape/{bookmaker}")
+async def scrape_live_odds(bookmaker: str) -> ScrapeResult:
+    """
+    Scrape live odds from a bookmaker using API interception.
+
+    This uses Playwright to open the sportsbook's live page and intercepts
+    the network requests to capture odds data directly from their internal API.
+
+    **Requires:**
+    - Bookmaker credentials configured
+    - Successful login (may require 2FA via Slack)
+
+    This is the recommended approach for real-time live odds - no delay
+    unlike third-party APIs.
+    """
+    if bookmaker.lower() not in ["fanduel", "draftkings", "fanatics"]:
+        return ScrapeResult(
+            bookmaker=bookmaker,
+            success=False,
+            error=f"Live interception only supported for CT books: fanduel, draftkings, fanatics",
+        )
+
+    if bookmaker not in session_manager._configs:
+        return ScrapeResult(
+            bookmaker=bookmaker,
+            success=False,
+            error=f"Bookmaker {bookmaker} not configured. Add to FEED_CONFIGS.",
+        )
+
+    # Ensure logged in (may trigger 2FA flow)
+    if not session_manager.ensure_logged_in(bookmaker):
+        return ScrapeResult(
+            bookmaker=bookmaker,
+            success=False,
+            error="Failed to login. Check credentials or use 2FA via Slack.",
+        )
+
+    # Get adapter and scrape
+    adapter = session_manager.get_adapter(bookmaker)
+    if not adapter:
+        return ScrapeResult(
+            bookmaker=bookmaker,
+            success=False,
+            error="Adapter not available",
+        )
+
+    return adapter.scrape()
+
+
+@app.post("/live/scrape-and-push/{bookmaker}")
+async def scrape_live_and_push(bookmaker: str) -> Dict:
+    """
+    Scrape live odds via API interception and push to arb detection pipeline.
+
+    This is the main endpoint for automated live arb detection using
+    browser-based scraping with network interception.
+    """
+    result = await scrape_live_odds(bookmaker)
+
+    if not result.success:
+        return {"success": False, "error": result.error}
+
+    if not result.odds:
+        return {"success": True, "message": "No live odds available", "count": 0}
+
+    # Push to odds_ingest
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ODDS_INGEST_URL}/process",
+                json=[odds.model_dump(mode="json") for odds in result.odds],
+            )
+            response.raise_for_status()
+
+        logger.info(f"[{bookmaker}] Pushed {len(result.odds)} live odds to pipeline")
+
+        return {
+            "success": True,
+            "odds_count": len(result.odds),
+            "live_odds_count": sum(1 for o in result.odds if o.is_live),
+            "message": f"Fetched and pushed {len(result.odds)} live odds",
+        }
+    except Exception as e:
+        logger.error(f"[{bookmaker}] Failed to push live odds: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visual Browser Login (User logs in manually in visible browser window)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/login/visual/{bookmaker}")
+async def visual_login(bookmaker: str, timeout_seconds: int = 300) -> Dict:
+    """
+    Open a visible browser window for manual login.
+
+    A Chrome window pops up to the sportsbook login page. You log in
+    manually (including 2FA), and the system saves your session. After
+    successful login, the browser closes and future scraping uses your
+    saved session.
+
+    **Steps:**
+    1. Call this endpoint
+    2. Browser window opens to login page
+    3. Log in manually (complete 2FA if required)
+    4. System detects login success, saves session, closes browser
+    5. All future scraping uses saved session until expiration
+
+    Args:
+        bookmaker: The sportsbook (fanduel, draftkings, fanatics)
+        timeout_seconds: How long to wait for login (default 5 minutes)
+
+    Returns:
+        Success status and session info
+    """
+    from .adapters.ct_sportsbooks import get_ct_config
+    from .stealth_playwright import StealthBrowser
+
+    bookmaker_lower = bookmaker.lower()
+
+    if bookmaker_lower not in ["fanduel", "draftkings", "fanatics"]:
+        return {
+            "success": False,
+            "error": f"Visual login only supported for CT books: fanduel, draftkings, fanatics",
+        }
+
+    # Get config for login URL
+    config = get_ct_config(bookmaker_lower)
+    if not config:
+        return {
+            "success": False,
+            "error": f"No configuration found for {bookmaker}",
+        }
+
+    login_url = config.get("login_url")
+    if not login_url:
+        return {
+            "success": False,
+            "error": f"No login_url configured for {bookmaker}",
+        }
+
+    logger.info(f"[{bookmaker}] Starting visual login flow")
+
+    # Create a new StealthBrowser instance in non-headless mode
+    browser = StealthBrowser(
+        bookmaker=bookmaker_lower,
+        headless=False,  # Visible browser window
+        geo="US",
+    )
+
+    try:
+        success = await browser.visual_login(
+            login_url=login_url,
+            timeout_seconds=timeout_seconds,
+        )
+
+        if success:
+            logger.info(f"[{bookmaker}] Visual login successful, session saved")
+
+            # Invalidate any existing adapter so it picks up new session
+            if bookmaker_lower in session_manager._adapters:
+                old_adapter = session_manager._adapters.pop(bookmaker_lower)
+                try:
+                    old_adapter.close()
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "bookmaker": bookmaker_lower,
+                "message": f"Login successful! Session saved for {bookmaker}. Future scraping will use this session.",
+                "session_dir": str(browser.session_dir),
+            }
+        else:
+            return {
+                "success": False,
+                "bookmaker": bookmaker_lower,
+                "error": "Login not completed within timeout. Please try again.",
+            }
+
+    except Exception as e:
+        logger.error(f"[{bookmaker}] Visual login failed: {e}")
+        return {
+            "success": False,
+            "bookmaker": bookmaker_lower,
+            "error": str(e),
+        }
+
+
+@app.get("/login/status")
+async def login_status() -> Dict:
+    """
+    Check login/session status for all CT sportsbooks.
+
+    Returns which bookmakers have saved sessions and whether they're valid.
+    """
+    from pathlib import Path
+
+    ct_books = ["fanduel", "draftkings", "fanatics"]
+    status = {}
+
+    for bookmaker in ct_books:
+        session_dir = Path(f"/tmp/sessions/{bookmaker}")
+        session_file = session_dir / "session.json"
+
+        has_session = session_file.exists()
+        session_age = None
+
+        if has_session:
+            try:
+                import os
+                mtime = os.path.getmtime(session_file)
+                from datetime import datetime
+                session_age = datetime.utcnow().timestamp() - mtime
+            except Exception:
+                pass
+
+        # Check adapter status
+        adapter = session_manager._adapters.get(bookmaker)
+        adapter_status = None
+        if adapter:
+            adapter_status = {
+                "type": type(adapter).__name__,
+                "logged_in": adapter.session_status.logged_in,
+                "session_valid": adapter.session_status.session_valid,
+            }
+
+        status[bookmaker] = {
+            "has_saved_session": has_session,
+            "session_age_seconds": int(session_age) if session_age else None,
+            "session_age_human": _format_duration(session_age) if session_age else None,
+            "adapter": adapter_status,
+        }
+
+    return {
+        "bookmakers": status,
+        "message": "Use POST /login/visual/{bookmaker} to log in via visible browser window",
+    }
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m {int(seconds % 60)}s"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        mins = int((seconds % 3600) / 60)
+        return f"{hours}h {mins}m"
+    else:
+        days = int(seconds / 86400)
+        hours = int((seconds % 86400) / 3600)
+        return f"{days}d {hours}h"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Bet Execution
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 from shared.schemas import BookmakerCredentials, FeedConfig, FeedStatus, SessionStatus
 from .adapters.base import BaseFeedAdapter
 from .adapters.generic import GenericSportsbookAdapter
+from .adapters.http_adapter import HTTPFeedAdapter
+from .adapters.intercepting_adapter import InterceptingAdapter
 
 logger = logging.getLogger(__name__)
 browser_logger = logging.getLogger("market_feed.browser.session")
@@ -87,12 +89,34 @@ class SessionManager:
             return self._adapters[bookmaker]
     
     def _create_adapter(self, bookmaker: str) -> BaseFeedAdapter:
-        """Create a new adapter instance."""
+        """Create a new adapter instance.
+
+        Priority:
+        1. HTTPFeedAdapter when cookies are available (fastest, most reliable)
+        2. InterceptingAdapter for CT sportsbooks (Playwright + API interception)
+        3. GenericSportsbookAdapter fallback (Selenium, legacy)
+        """
         config = self._configs[bookmaker]
         credentials = self._credentials[bookmaker]
-        
-        # For now, use the generic adapter
-        # In the future, could use a factory pattern for specific adapters
+
+        # Prefer HTTP adapter when cookies are available
+        if self._has_imported_cookies(bookmaker):
+            logger.info(f"[{bookmaker}] Using HTTPFeedAdapter (cookies available)")
+            adapter = HTTPFeedAdapter(config, credentials)
+            adapter.initialize()
+            return adapter
+
+        # Use InterceptingAdapter for CT sportsbooks (Playwright + network interception)
+        # This is the recommended approach for live odds scraping
+        ct_books = ["fanduel", "draftkings", "fanatics"]
+        if bookmaker.lower() in ct_books:
+            logger.info(f"[{bookmaker}] Using InterceptingAdapter (Playwright + API interception)")
+            # InterceptingAdapter is async, but we return it here for lazy init
+            # The actual browser initialization happens when login() is called
+            return InterceptingAdapter(config, credentials)
+
+        # Fall back to Selenium adapter (may not work in Docker)
+        logger.info(f"[{bookmaker}] Using GenericSportsbookAdapter (no cookies)")
         return GenericSportsbookAdapter(config, credentials)
     
     def _has_imported_cookies(self, bookmaker: str) -> bool:
@@ -130,30 +154,44 @@ class SessionManager:
             )
             return False
 
-        # Already logged in and session valid
+        # Check for imported cookies — if present, ensure we're using HTTP adapter
+        # This check comes FIRST because we may need to switch adapter types
+        if self._has_imported_cookies(bookmaker):
+            cookies = self._load_imported_cookies(bookmaker)
+            if cookies:
+                # If current adapter is not HTTPFeedAdapter, recreate it
+                if not isinstance(adapter, HTTPFeedAdapter):
+                    browser_logger.info(
+                        f"Switching {bookmaker} to HTTPFeedAdapter (cookies imported)",
+                        extra={"event_type": "adapter_switch", "bookmaker": bookmaker}
+                    )
+                    with self._lock:
+                        # Close old adapter
+                        if bookmaker in self._adapters:
+                            self._adapters[bookmaker].close()
+                        # Create new HTTP adapter
+                        self._adapters[bookmaker] = self._create_adapter(bookmaker)
+                        adapter = self._adapters[bookmaker]
+                elif not adapter.session_status.session_valid:
+                    browser_logger.info(
+                        f"Using imported cookies for {bookmaker} ({len(cookies)} cookies)",
+                        extra={"event_type": "cookie_auth", "bookmaker": bookmaker}
+                    )
+
+                adapter.session_status.logged_in = True
+                adapter.session_status.session_valid = True
+                adapter.session_status.last_login_at = datetime.utcnow()
+                adapter.session_status.login_failures = 0
+                adapter.session_status.error = None
+                return True
+
+        # Already logged in and session valid (no cookies available)
         if adapter.session_status.session_valid:
             browser_logger.debug(
                 f"Session valid for {bookmaker}",
                 extra={"event_type": "session_valid", "bookmaker": bookmaker}
             )
             return True
-
-        # Check for imported cookies — if present, mark session as valid
-        if self._has_imported_cookies(bookmaker):
-            cookies = self._load_imported_cookies(bookmaker)
-            if cookies:
-                browser_logger.info(
-                    f"Using imported cookies for {bookmaker} ({len(cookies)} cookies)",
-                    extra={"event_type": "cookie_auth", "bookmaker": bookmaker}
-                )
-                adapter.session_status.logged_in = True
-                adapter.session_status.session_valid = True
-                adapter.session_status.last_login_at = datetime.utcnow()
-                adapter.session_status.login_failures = 0
-                adapter.session_status.error = None
-                # Store cookies on adapter for use in scraping
-                adapter._imported_cookies = cookies
-                return True
 
         # Check if we can attempt login (rate limiting)
         if not self._can_attempt_login(bookmaker):

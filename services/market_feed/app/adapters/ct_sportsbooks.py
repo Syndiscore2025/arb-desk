@@ -22,18 +22,16 @@ FANDUEL_CT_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "login_url": "https://sportsbook.fanduel.com/login",
     "odds_urls": [
-        # NFL
-        "https://sportsbook.fanduel.com/navigation/nfl",
+        # FanDuel API endpoints - these return JSON with odds data
+        # The tab IDs correspond to: all games, spreads, totals, moneyline
         # NBA
-        "https://sportsbook.fanduel.com/navigation/nba",
+        "https://sbapi.fanduel.com/sportsbook/v1/navigation/sports/nba/events?marketType=moneyline",
+        # NFL
+        "https://sbapi.fanduel.com/sportsbook/v1/navigation/sports/nfl/events?marketType=moneyline",
         # MLB
-        "https://sportsbook.fanduel.com/navigation/mlb",
+        "https://sbapi.fanduel.com/sportsbook/v1/navigation/sports/mlb/events?marketType=moneyline",
         # NHL
-        "https://sportsbook.fanduel.com/navigation/nhl",
-        # NCAA Football
-        "https://sportsbook.fanduel.com/navigation/college-football",
-        # NCAA Basketball
-        "https://sportsbook.fanduel.com/navigation/college-basketball",
+        "https://sbapi.fanduel.com/sportsbook/v1/navigation/sports/nhl/events?marketType=moneyline",
     ],
     "live_odds_urls": [
         "https://sportsbook.fanduel.com/live",

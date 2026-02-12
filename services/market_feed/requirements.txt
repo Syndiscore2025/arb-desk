@@ -20,3 +20,6 @@ python-dotenv==1.0.1
 pyotp==2.9.0  # For TOTP 2FA code generation
 bezier==2023.7.28  # For realistic mouse curves
 
+# TLS fingerprint impersonation (bypass sportsbook API protection)
+curl_cffi==0.7.4
+

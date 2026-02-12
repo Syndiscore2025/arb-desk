@@ -403,6 +403,18 @@ async def handle_slack_events(request: Request) -> Dict:
         logger.info(f"Bet command result: {result}")
         return {"ok": True}
 
+    # Parse visual login command: "arb login visual <bookmaker>"
+    visual_login_match = re.match(
+        r"arb\s+login\s+visual\s+(\S+)",
+        text,
+        re.IGNORECASE,
+    )
+    if visual_login_match:
+        bookmaker = visual_login_match.group(1)
+        result = await handle_visual_login_command(bookmaker, user_id)
+        logger.info(f"Visual login command result: {result}")
+        return {"ok": True}
+
     # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool|login [service]"
     arb_match = re.match(
         r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
@@ -884,12 +896,26 @@ async def handle_login_command(bookmaker: Optional[str], user_id: str) -> Dict:
     Handle login command from Slack.
 
     Usage:
-        arb login           - Start login for all configured bookmakers
-        arb login fanduel   - Start login for specific bookmaker
+        arb login                   - Start login for all configured bookmakers
+        arb login fanduel           - Start login for specific bookmaker
+        arb login visual fanduel    - Open visible browser window for manual login
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # Check for visual login mode: "arb login visual <bookmaker>"
+            if bookmaker and bookmaker.lower() == "visual":
+                await _send_slack_response(
+                    "❌ Usage: `arb login visual <bookmaker>` (e.g., `arb login visual fanduel`)",
+                    user_id
+                )
+                return {"success": False, "error": "Missing bookmaker for visual login"}
+
             if bookmaker:
+                # Check if it's a visual login request passed as second arg
+                # This handles the case where the regex captures "visual" as bookmaker
+                # and the actual bookmaker comes later in the message
+
+                # For now, handle standard bookmaker login
                 # Login to specific bookmaker
                 await _send_slack_response(
                     f"🔐 Starting login for *{bookmaker}*...",
@@ -976,6 +1002,62 @@ async def handle_login_command(bookmaker: Optional[str], user_id: str) -> Dict:
         return {"success": False, "error": str(e)}
 
 
+async def handle_visual_login_command(bookmaker: str, user_id: str) -> Dict:
+    """
+    Handle visual login command from Slack.
+
+    Opens a visible browser window on the host machine for manual login.
+    The user completes login (including 2FA), and the system saves the session.
+
+    Usage:
+        arb login visual fanduel
+        arb login visual draftkings
+        arb login visual fanatics
+    """
+    try:
+        # Validate bookmaker
+        if bookmaker.lower() not in ["fanduel", "draftkings", "fanatics"]:
+            await _send_slack_response(
+                f"❌ Visual login only supports: fanduel, draftkings, fanatics",
+                user_id
+            )
+            return {"success": False, "error": "Invalid bookmaker"}
+
+        await _send_slack_response(
+            f"🖥️ Opening browser window for *{bookmaker}* login...\n"
+            f"Complete login manually (including 2FA). The system will save your session.",
+            user_id
+        )
+
+        # Increased timeout for visual login - it takes time to complete 2FA
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            response = await client.post(
+                f"{MARKET_FEED_URL}/login/visual/{bookmaker}",
+                params={"timeout_seconds": 300},  # 5 minute timeout
+            )
+            data = response.json()
+
+            if data.get("success"):
+                await _send_slack_response(
+                    f"✅ *{bookmaker}* login successful!\n"
+                    f"Session saved. Future scraping will use this session.",
+                    user_id
+                )
+            else:
+                error = data.get("error", "Unknown error")
+                await _send_slack_response(
+                    f"❌ *{bookmaker}* visual login failed: {error}",
+                    user_id
+                )
+
+            return data
+
+    except Exception as e:
+        logger.error(f"Visual login command failed: {e}")
+        await _send_slack_response(f"❌ Visual login failed: {e}", user_id)
+        return {"success": False, "error": str(e)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Slack Socket Mode Listener
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,6 +1098,18 @@ async def _process_message_async(text: str, user_id: str, channel: str) -> None:
         logger.info(f"Bet command result: {result}")
         return
 
+    # Parse visual login command: "arb login visual <bookmaker>"
+    visual_login_match = re.match(
+        r"arb\s+login\s+visual\s+(\S+)",
+        text,
+        re.IGNORECASE,
+    )
+    if visual_login_match:
+        bookmaker = visual_login_match.group(1)
+        result = await handle_visual_login_command(bookmaker, user_id)
+        logger.info(f"Socket Mode visual login result: {result}")
+        return
+
     # Parse service control commands
     arb_match = re.match(
         r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
@@ -1045,6 +1139,7 @@ async def _process_message_async(text: str, user_id: str, channel: str) -> None:
             "❓ Unknown command. Available commands:\n"
             "• `arb status` - Service status\n"
             "• `arb login [bookmaker]` - Login to bookmakers\n"
+            "• `arb login visual <bookmaker>` - Open browser window for manual login\n"
             "• `arb scrape` - Trigger scrape\n"
             "• `arb logs [errors|browser|summary]` - View logs\n"
             "• `arb heat [bookmaker]` - View heat scores\n"

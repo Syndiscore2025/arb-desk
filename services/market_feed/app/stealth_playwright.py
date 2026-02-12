@@ -608,6 +608,119 @@ class StealthBrowser:
 
         logger.info(f"[{self.bookmaker}] Browser closed")
 
+    async def visual_login(
+        self,
+        login_url: str,
+        success_indicators: Optional[List[str]] = None,
+        timeout_seconds: int = 300,
+    ) -> bool:
+        """
+        Open a visible browser window for manual login.
+
+        The user logs in manually (including 2FA), and this method waits
+        for login success indicators before saving the session and closing.
+
+        Args:
+            login_url: The sportsbook login page URL
+            success_indicators: CSS selectors that indicate successful login
+                (e.g., account dropdown, balance display, user avatar)
+            timeout_seconds: How long to wait for login (default 5 minutes)
+
+        Returns:
+            True if login was successful, False otherwise
+        """
+        # Default success indicators for common sportsbooks
+        if success_indicators is None:
+            success_indicators = [
+                # Common logged-in indicators
+                "[data-testid='account-dropdown']",
+                "[data-testid='user-menu']",
+                ".account-menu",
+                ".user-balance",
+                ".my-account",
+                "[aria-label='Account']",
+                "[aria-label='My Account']",
+                ".logged-in",
+                # FanDuel specific
+                "[data-test-id='AccountDetails']",
+                ".account-balance",
+                # DraftKings specific
+                "[data-testid='dk-user-dropdown']",
+                ".account-icon",
+                # Fanatics specific
+                ".profile-menu",
+            ]
+
+        logger.info(f"[{self.bookmaker}] Starting visual login (non-headless mode)")
+
+        # Force non-headless mode for visual login
+        original_headless = self.headless
+        self.headless = False
+
+        try:
+            # Initialize browser in visible mode
+            await self.initialize()
+
+            # Navigate to login page
+            logger.info(f"[{self.bookmaker}] Navigating to login page: {login_url}")
+            await self.page.goto(login_url, wait_until="networkidle")
+
+            # Wait for user to complete login
+            logger.info(
+                f"[{self.bookmaker}] Browser window opened. "
+                f"Please complete login (including 2FA if required). "
+                f"Waiting up to {timeout_seconds} seconds..."
+            )
+
+            # Poll for success indicators
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                # Check each success indicator
+                for selector in success_indicators:
+                    try:
+                        element = await self.page.query_selector(selector)
+                        if element:
+                            is_visible = await element.is_visible()
+                            if is_visible:
+                                logger.info(
+                                    f"[{self.bookmaker}] Login successful! "
+                                    f"Detected indicator: {selector}"
+                                )
+                                # Save session immediately
+                                await self.save_session()
+                                return True
+                    except Exception:
+                        pass  # Selector not found, continue checking
+
+                # Also check URL for logged-in redirects
+                current_url = self.page.url.lower()
+                if any(indicator in current_url for indicator in [
+                    "/account", "/my-bets", "/wallet", "/deposit",
+                    "logged=true", "authenticated"
+                ]):
+                    logger.info(
+                        f"[{self.bookmaker}] Login successful! "
+                        f"Detected logged-in URL: {current_url}"
+                    )
+                    await self.save_session()
+                    return True
+
+                # Wait before next check
+                await asyncio.sleep(1)
+
+            logger.warning(f"[{self.bookmaker}] Login timeout after {timeout_seconds} seconds")
+            return False
+
+        except Exception as e:
+            logger.error(f"[{self.bookmaker}] Visual login failed: {e}")
+            return False
+
+        finally:
+            # Restore original headless setting
+            self.headless = original_headless
+            # Close the browser
+            await self.close()
+
 
 class ResidentialProxyRotator:
     """
