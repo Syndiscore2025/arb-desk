@@ -168,7 +168,8 @@ def test_promo_converter_free_bet_no_stake():
     assert data["promo_amount"] == 50.0
     assert data["recommended_hedge_stake"] > 0
     assert data["guaranteed_profit"] > 0
-    assert 0.6 < data["conversion_rate"] < 0.85  # Typical 60-85% conversion
+    # For +200 hedged at -110, conversion can be very high (~95%).
+    assert data["conversion_rate"] == pytest.approx(0.9529, abs=1e-4)
 
 
 def test_promo_converter_profit_boost():

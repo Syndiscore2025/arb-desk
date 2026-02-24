@@ -38,7 +38,11 @@ from shared.schemas import (
 from shared.logging_config import setup_logging
 from .session_manager import session_manager
 from .bet_executor import BetExecutor
-from .adapters.prediction_markets import PolymarketAdapter, KalshiAdapter
+from .adapters.prediction_markets import (
+    KalshiAdapter,
+    PolymarketAdapter,
+    PredictionMarketEventUnifier,
+)
 
 # Configure logging
 logger = setup_logging("market_feed")
@@ -62,6 +66,9 @@ _submitted_2fa_codes: Dict[str, str] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 _poller_tasks: Dict[str, asyncio.Task] = {}   # bookmaker -> background Task
 _poller_stats: Dict[str, Dict] = {}           # bookmaker -> runtime stats
+
+# Track prediction-market adapter instances so we can close HTTP clients on shutdown
+_prediction_market_adapters: List[object] = []
 
 # Randomized polling bounds (seconds)
 POLL_MIN_INTERVAL = int(os.getenv("POLL_MIN_INTERVAL", "45"))
@@ -257,6 +264,10 @@ async def _prediction_market_poll_loop(market_name: str, adapter) -> None:
 
         except asyncio.CancelledError:
             logger.info(f"[{market_name}] Poller cancelled")
+            try:
+                await adapter.close()
+            except Exception:
+                pass
             return
         except Exception as exc:
             consecutive_errors += 1
@@ -278,6 +289,136 @@ async def _prediction_market_poll_loop(market_name: str, adapter) -> None:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             logger.info(f"[{market_name}] Poller cancelled during sleep")
+            try:
+                await adapter.close()
+            except Exception:
+                pass
+            return
+
+
+async def _prediction_market_combined_poll_loop(poly_adapter: PolymarketAdapter, kalshi_adapter: KalshiAdapter) -> None:
+    """Poll Polymarket + Kalshi together, unify IDs, and push a single batch.
+
+    This is required for cross-market arbitrage detection because odds_ingest/arb_math
+    only sees arbitrage opportunities within a single POSTed batch.
+    """
+    market_name = "prediction_markets"
+    _poller_stats[market_name] = {
+        "started_at": datetime.utcnow().isoformat(),
+        "poll_count": 0,
+        "success_count": 0,
+        "error_count": 0,
+        "last_poll_at": None,
+        "last_error": None,
+        "next_delay": None,
+    }
+
+    unifier = PredictionMarketEventUnifier()
+
+    stagger = random.uniform(5, 30)
+    logger.info(f"[{market_name}] Combined prediction poller starting in {stagger:.1f}s")
+    await asyncio.sleep(stagger)
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+    BASE_ERROR_BACKOFF = 60
+
+    while True:
+        poll_start = datetime.utcnow()
+        _poller_stats[market_name]["poll_count"] += 1
+        _poller_stats[market_name]["last_poll_at"] = poll_start.isoformat()
+
+        try:
+            poly_res, kalshi_res = await asyncio.gather(
+                poly_adapter.fetch_markets(),
+                kalshi_adapter.fetch_markets(),
+                return_exceptions=True,
+            )
+
+            poly_odds: List[MarketOdds] = []
+            kalshi_odds: List[MarketOdds] = []
+            if isinstance(poly_res, Exception):
+                logger.error(f"[{market_name}] Polymarket fetch error: {poly_res}")
+            else:
+                poly_odds = poly_res or []
+
+            if isinstance(kalshi_res, Exception):
+                logger.error(f"[{market_name}] Kalshi fetch error: {kalshi_res}")
+            else:
+                kalshi_odds = kalshi_res or []
+
+            if poly_odds and kalshi_odds:
+                combined_odds, meta = unifier.unify(poly_odds, kalshi_odds)
+                logger.info(
+                    "[%s] poly=%s kalshi=%s combined=%s matched_pairs=%s",
+                    market_name,
+                    len(poly_odds),
+                    len(kalshi_odds),
+                    len(combined_odds),
+                    meta.get("matched_pairs"),
+                )
+            else:
+                combined_odds = poly_odds + kalshi_odds
+                logger.info(
+                    "[%s] poly=%s kalshi=%s combined=%s (no unify)",
+                    market_name,
+                    len(poly_odds),
+                    len(kalshi_odds),
+                    len(combined_odds),
+                )
+
+            if combined_odds:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        f"{ODDS_INGEST_URL}/process",
+                        json=[o.model_dump(mode="json") for o in combined_odds],
+                    )
+                    resp.raise_for_status()
+                logger.info(f"[{market_name}] Pushed {len(combined_odds)} odds → pipeline")
+            else:
+                logger.info(f"[{market_name}] No odds available this cycle")
+
+            _poller_stats[market_name]["success_count"] += 1
+            consecutive_errors = 0
+
+        except asyncio.CancelledError:
+            logger.info(f"[{market_name}] Poller cancelled")
+            try:
+                await poly_adapter.close()
+            except Exception:
+                pass
+            try:
+                await kalshi_adapter.close()
+            except Exception:
+                pass
+            return
+        except Exception as exc:
+            consecutive_errors += 1
+            _poller_stats[market_name]["error_count"] += 1
+            _poller_stats[market_name]["last_error"] = str(exc)[:200]
+            logger.error(f"[{market_name}] Poll error ({consecutive_errors}): {exc}")
+
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            backoff = min(BASE_ERROR_BACKOFF * (2 ** (consecutive_errors - MAX_CONSECUTIVE_ERRORS)), 600)
+            delay = backoff + random.uniform(0, 30)
+            logger.warning(f"[{market_name}] {consecutive_errors} errors — backing off {delay:.0f}s")
+        else:
+            delay = PRED_POLL_INTERVAL + random.uniform(-30, 30)
+
+        _poller_stats[market_name]["next_delay"] = round(delay, 1)
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            logger.info(f"[{market_name}] Poller cancelled during sleep")
+            try:
+                await poly_adapter.close()
+            except Exception:
+                pass
+            try:
+                await kalshi_adapter.close()
+            except Exception:
+                pass
             return
 
 
@@ -314,23 +455,39 @@ async def startup_event():
         )
 
     # ── Prediction Market Pollers ──────────────────────────────────────────
-    if os.getenv("POLYMARKET_ENABLED", "false").lower() == "true":
-        poly_adapter = PolymarketAdapter()
-        task = asyncio.create_task(
-            _prediction_market_poll_loop("polymarket", poly_adapter),
-            name="auto_poll_polymarket",
-        )
-        _poller_tasks["polymarket"] = task
-        logger.info("[polymarket] Auto-poller scheduled (prediction market, ~2min interval)")
+    poly_enabled = os.getenv("POLYMARKET_ENABLED", "false").lower() == "true"
+    kalshi_enabled = os.getenv("KALSHI_ENABLED", "false").lower() == "true"
 
-    if os.getenv("KALSHI_ENABLED", "false").lower() == "true":
+    if poly_enabled and kalshi_enabled:
+        poly_adapter = PolymarketAdapter()
         kalshi_adapter = KalshiAdapter()
+        _prediction_market_adapters.extend([poly_adapter, kalshi_adapter])
         task = asyncio.create_task(
-            _prediction_market_poll_loop("kalshi", kalshi_adapter),
-            name="auto_poll_kalshi",
+            _prediction_market_combined_poll_loop(poly_adapter, kalshi_adapter),
+            name="auto_poll_prediction_markets",
         )
-        _poller_tasks["kalshi"] = task
-        logger.info("[kalshi] Auto-poller scheduled (prediction market, ~2min interval)")
+        _poller_tasks["prediction_markets"] = task
+        logger.info("[prediction_markets] Auto-poller scheduled (combined Polymarket+Kalshi, ~2min interval)")
+    else:
+        if poly_enabled:
+            poly_adapter = PolymarketAdapter()
+            _prediction_market_adapters.append(poly_adapter)
+            task = asyncio.create_task(
+                _prediction_market_poll_loop("polymarket", poly_adapter),
+                name="auto_poll_polymarket",
+            )
+            _poller_tasks["polymarket"] = task
+            logger.info("[polymarket] Auto-poller scheduled (prediction market, ~2min interval)")
+
+        if kalshi_enabled:
+            kalshi_adapter = KalshiAdapter()
+            _prediction_market_adapters.append(kalshi_adapter)
+            task = asyncio.create_task(
+                _prediction_market_poll_loop("kalshi", kalshi_adapter),
+                name="auto_poll_kalshi",
+            )
+            _poller_tasks["kalshi"] = task
+            logger.info("[kalshi] Auto-poller scheduled (prediction market, ~2min interval)")
 
     if _poller_tasks:
         logger.info(
@@ -352,6 +509,14 @@ async def shutdown_event():
     _poller_tasks.clear()
 
     session_manager.close_all()
+
+    # Close prediction market adapters (HTTP clients)
+    for adapter in list(_prediction_market_adapters):
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+    _prediction_market_adapters.clear()
 
 
 @app.get("/health", response_model=HealthResponse)

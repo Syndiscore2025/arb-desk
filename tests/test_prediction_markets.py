@@ -4,6 +4,12 @@ Tests for prediction market adapters (Polymarket, Kalshi).
 import pytest
 from datetime import datetime
 
+from shared.schemas import MarketOdds
+from services.market_feed.app.adapters.prediction_markets import (
+    PolymarketAdapter,
+    PredictionMarketEventUnifier,
+)
+
 
 class TestPolymarketLogic:
     """Test Polymarket adapter logic."""
@@ -118,6 +124,74 @@ class TestCrossMarketArbitrage:
         # Bad match
         score2 = match_score("Lakers vs Celtics", "Heat vs Bulls")
         assert score2 <= 0.2
+
+
+class TestPredictionMarketUnifier:
+    def test_unifier_matches_similar_questions_and_unifies_event_id(self):
+        poly = [
+            MarketOdds(
+                event_id="poly-abc",
+                sport="prediction",
+                market="Will Trump win the 2024 election?",
+                bookmaker="polymarket",
+                selection="Yes",
+                odds_decimal=1.90,
+                market_type="prediction",
+            )
+        ]
+        kalshi = [
+            MarketOdds(
+                event_id="kalshi-xyz",
+                sport="prediction",
+                market="Will Donald Trump win the 2024 election?",
+                bookmaker="kalshi",
+                selection="Yes",
+                odds_decimal=1.85,
+                market_type="prediction",
+            )
+        ]
+
+        unified, meta = PredictionMarketEventUnifier(min_match_score=0.5).unify(poly, kalshi)
+        assert meta["matched_pairs"] == 1
+        assert len(unified) == 2
+        assert unified[0].event_id == unified[1].event_id
+        assert unified[0].event_id.startswith("pred-")
+        # Canonical market is Kalshi's market string
+        assert unified[0].market == "Will Donald Trump win the 2024 election?"[:100]
+
+    def test_unifier_does_not_match_unrelated_questions(self):
+        poly = [
+            MarketOdds(
+                event_id="poly-1",
+                sport="prediction",
+                market="Will Bitcoin be above $100k by year end?",
+                bookmaker="polymarket",
+                selection="Yes",
+                odds_decimal=2.50,
+                market_type="prediction",
+            )
+        ]
+        kalshi = [
+            MarketOdds(
+                event_id="kalshi-1",
+                sport="prediction",
+                market="Will the Lakers win tonight?",
+                bookmaker="kalshi",
+                selection="Yes",
+                odds_decimal=1.70,
+                market_type="prediction",
+            )
+        ]
+
+        unified, meta = PredictionMarketEventUnifier(min_match_score=0.9).unify(poly, kalshi)
+        assert meta["matched_pairs"] == 0
+        assert unified[0].event_id == "poly-1"
+        assert unified[1].event_id == "kalshi-1"
+
+    def test_polymarket_yes_no_normalization(self):
+        assert PolymarketAdapter._normalize_yes_no("YES") == "Yes"
+        assert PolymarketAdapter._normalize_yes_no("no") == "No"
+        assert PolymarketAdapter._normalize_yes_no("maybe") is None
 
 
 class TestCLVCalculation:

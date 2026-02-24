@@ -1,4 +1,20 @@
-"""Quick test script to debug Polymarket and Kalshi connectivity."""
+"""Quick connectivity script for Polymarket and Kalshi.
+
+Note: this is a *manual* debug script, not a pytest test module.
+Pytest will try to collect it because of the filename, so we skip it when
+imported under pytest.
+"""
+
+import sys
+
+if "pytest" in sys.modules:  # pragma: no cover
+    import pytest
+
+    pytest.skip(
+        "scripts/test_prediction_markets.py is a manual connectivity script; run it via `python scripts/test_prediction_markets.py`",
+        allow_module_level=True,
+    )
+
 import asyncio
 import httpx
 import os

@@ -65,7 +65,13 @@ class TestArbMathAPI:
             ]
         }
         
-        response = httpx.post(f"{ARB_MATH_URL}/arbitrage", json=payload, timeout=10)
+        # Force evaluation output even when no arb meets the default MIN_ARB_PROFIT_PCT filter.
+        response = httpx.post(
+            f"{ARB_MATH_URL}/arbitrage",
+            params={"min_profit_pct": 0.0},
+            json=payload,
+            timeout=10,
+        )
         assert response.status_code == 200
         
         data = response.json()
@@ -103,7 +109,13 @@ class TestArbMathAPI:
             ]
         }
         
-        response = httpx.post(f"{ARB_MATH_URL}/arbitrage", json=payload, timeout=10)
+        # Force evaluation output even when no arb meets the default MIN_ARB_PROFIT_PCT filter.
+        response = httpx.post(
+            f"{ARB_MATH_URL}/arbitrage",
+            params={"min_profit_pct": 0.0},
+            json=payload,
+            timeout=10,
+        )
         assert response.status_code == 200
         
         data = response.json()

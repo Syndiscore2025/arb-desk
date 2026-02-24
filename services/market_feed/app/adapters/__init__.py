@@ -1,63 +1,101 @@
-# Feed adapters
-from .base import BaseFeedAdapter
-from .generic import GenericSportsbookAdapter
+"""market_feed adapters package.
 
-# Playwright-based adapters (stealth)
-from .playwright_adapter import PlaywrightFeedAdapter
-from .playwright_generic import PlaywrightGenericAdapter
+Important: many adapters depend on optional heavy browser stacks (Selenium,
+Playwright, stealth drivers). Unit tests and lightweight environments should
+still be able to import the prediction-market adapters without having those
+dependencies installed.
 
-# Connecticut sportsbook configurations
-from .ct_sportsbooks import (
-    CT_SPORTSBOOK_CONFIGS,
-    FANDUEL_CT_CONFIG,
-    DRAFTKINGS_CT_CONFIG,
-    FANATICS_CT_CONFIG,
-    get_ct_config,
-    get_all_ct_configs,
-)
+So: we eagerly export the lightweight adapters and *guard* imports of
+browser-based adapters.
+"""
 
-# Prediction market adapters (API-based)
-from .prediction_markets import (
-    PolymarketAdapter,
+from __future__ import annotations
+
+from typing import List
+
+# Always-available, API-only adapters
+from .prediction_markets import (  # noqa: F401
     KalshiAdapter,
+    PolymarketAdapter,
     PredictionMarketArbFinder,
+    PredictionMarketEventUnifier,
 )
 
-# Offshore/sharp book adapters
-from .pinnacle_adapter import PinnacleAdapter, CLVCalculator
+# Config-only module (no browser deps)
+from .ct_sportsbooks import (  # noqa: F401
+    CT_SPORTSBOOK_CONFIGS,
+    DRAFTKINGS_CT_CONFIG,
+    FANDUEL_CT_CONFIG,
+    FANATICS_CT_CONFIG,
+    get_all_ct_configs,
+    get_ct_config,
+)
 
-# Third-party odds API (pre-game odds, no browser needed)
-from .odds_api_adapter import OddsAPIAdapter
-
-# API interception adapter (real-time live odds)
-from .intercepting_adapter import InterceptingAdapter
-
-# DraftKings Public API adapter (unauthenticated)
-from .draftkings_public_api import DraftKingsPublicAPIAdapter
-
-__all__ = [
-    "BaseFeedAdapter",
-    "GenericSportsbookAdapter",
-    "PlaywrightFeedAdapter",
-    "PlaywrightGenericAdapter",
+__all__: List[str] = [
+    # Prediction markets
+    "PolymarketAdapter",
+    "KalshiAdapter",
+    "PredictionMarketArbFinder",
+    "PredictionMarketEventUnifier",
+    # CT configs
     "CT_SPORTSBOOK_CONFIGS",
     "FANDUEL_CT_CONFIG",
     "DRAFTKINGS_CT_CONFIG",
     "FANATICS_CT_CONFIG",
     "get_ct_config",
     "get_all_ct_configs",
-    # Prediction markets
-    "PolymarketAdapter",
-    "KalshiAdapter",
-    "PredictionMarketArbFinder",
-    # Offshore/sharp
-    "PinnacleAdapter",
-    "CLVCalculator",
-    # Third-party odds API
-    "OddsAPIAdapter",
-    # API interception (live odds)
-    "InterceptingAdapter",
-    # DraftKings Public API (unauthenticated)
-    "DraftKingsPublicAPIAdapter",
 ]
+
+
+def _try_export(name: str, fn) -> None:
+    """Best-effort optional import/export.
+
+    We swallow ImportError so unit tests can run without browser dependencies.
+    """
+
+    try:
+        obj = fn()
+    except ImportError:
+        return
+    except Exception:
+        # Defensive: don't break package import on unexpected environment issues.
+        return
+    globals()[name] = obj
+    __all__.append(name)
+
+
+# Optional adapters (browser stacks and extra deps)
+_try_export("BaseFeedAdapter", lambda: __import__(__name__ + ".base", fromlist=["BaseFeedAdapter"]).BaseFeedAdapter)
+_try_export(
+    "GenericSportsbookAdapter",
+    lambda: __import__(__name__ + ".generic", fromlist=["GenericSportsbookAdapter"]).GenericSportsbookAdapter,
+)
+_try_export(
+    "PlaywrightFeedAdapter",
+    lambda: __import__(__name__ + ".playwright_adapter", fromlist=["PlaywrightFeedAdapter"]).PlaywrightFeedAdapter,
+)
+_try_export(
+    "PlaywrightGenericAdapter",
+    lambda: __import__(__name__ + ".playwright_generic", fromlist=["PlaywrightGenericAdapter"]).PlaywrightGenericAdapter,
+)
+_try_export(
+    "PinnacleAdapter",
+    lambda: __import__(__name__ + ".pinnacle_adapter", fromlist=["PinnacleAdapter"]).PinnacleAdapter,
+)
+_try_export(
+    "CLVCalculator",
+    lambda: __import__(__name__ + ".pinnacle_adapter", fromlist=["CLVCalculator"]).CLVCalculator,
+)
+_try_export(
+    "OddsAPIAdapter",
+    lambda: __import__(__name__ + ".odds_api_adapter", fromlist=["OddsAPIAdapter"]).OddsAPIAdapter,
+)
+_try_export(
+    "InterceptingAdapter",
+    lambda: __import__(__name__ + ".intercepting_adapter", fromlist=["InterceptingAdapter"]).InterceptingAdapter,
+)
+_try_export(
+    "DraftKingsPublicAPIAdapter",
+    lambda: __import__(__name__ + ".draftkings_public_api", fromlist=["DraftKingsPublicAPIAdapter"]).DraftKingsPublicAPIAdapter,
+)
 
