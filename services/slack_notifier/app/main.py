@@ -186,19 +186,109 @@ def _format_arb_alert(alert: ArbAlert) -> str:
     return "\n".join(lines)
 
 
+def _format_positive_ev_alert(alert: ArbAlert) -> str:
+    """Format a +EV alert with edge details."""
+    opp = alert.opportunity
+
+    # Get main details from first leg
+    leg = opp.legs[0] if opp.legs else {}
+    bookmaker = leg.get("bookmaker", "Unknown")
+    selection = leg.get("selection", "Unknown")
+    odds = leg.get("odds_decimal", 0)
+    fair_odds = leg.get("fair_odds", 0)
+    ev_pct = opp.ev_percentage or 0
+
+    lines = [
+        f"📈 *+{ev_pct:.1f}% POSITIVE EV*",
+        "",
+        f"*Event:* {opp.event_id}",
+        f"*Market:* {opp.market}",
+        "",
+        f"*Book:* {bookmaker}",
+        f"*Selection:* {selection}",
+        f"*Offered Odds:* {odds:.3f}",
+        f"*Fair Odds:* {fair_odds:.3f}",
+        "",
+        f"*True Probability:* {opp.true_probability*100:.1f}%" if opp.true_probability else "",
+        f"*Kelly Fraction:* {opp.kelly_fraction*100:.1f}% of bankroll" if opp.kelly_fraction else "",
+    ]
+
+    # Filter out empty lines
+    lines = [l for l in lines if l]
+
+    lines.append("")
+    lines.append("─────────────────────────────")
+    lines.append("_+EV bets are profitable long-term, not guaranteed per bet._")
+
+    return "\n".join(lines)
+
+
+def _format_middle_alert(alert: ArbAlert) -> str:
+    """Format a middle opportunity alert."""
+    opp = alert.opportunity
+
+    lines = [
+        f"🎯 *MIDDLE OPPORTUNITY*",
+        "",
+        f"*Event:* {opp.event_id}",
+        f"*Type:* {opp.market}",
+        "",
+        f"*Middle Range:* {opp.middle_range}",
+        f"*Gap:* {opp.middle_gap:.1f} points",
+        f"*Hit Probability:* ~{opp.middle_probability*100:.0f}%" if opp.middle_probability else "",
+        "",
+        "*📋 Legs:*",
+    ]
+
+    for leg in opp.legs:
+        bookmaker = leg.get("bookmaker", "Unknown")
+        selection = leg.get("selection", "Unknown")
+        odds = leg.get("odds_decimal", 0)
+        line = leg.get("line", "")
+        lines.append(f"• *{bookmaker}*: {selection} ({line:+.1f}) @ {odds:.2f}")
+
+    lines.append("")
+    lines.append("─────────────────────────────")
+    lines.append("_Middles: worst case lose vig, best case win both sides._")
+
+    return "\n".join(lines)
+
+
 @app.post("/alert/arb")
 async def send_arb_alert(opportunity: ArbOpportunity) -> SlackNotificationResponse:
     """
-    Send a tiered arb alert to Slack.
+    Send an opportunity alert to Slack.
 
-    Creates an alert with bet details and stores it for bet command processing.
+    Handles all opportunity types: arb, positive_ev, middle.
+    Creates an alert with details and stores it for bet command processing.
     """
-    # Determine tier
-    profit = opportunity.profit_percentage or 0
-    if profit >= 3.0:
-        tier = "fire"
-    elif profit >= 1.5:
-        tier = "lightning"
+    opp_type = opportunity.opportunity_type or "arb"
+
+    # Determine tier based on opportunity type
+    if opp_type == "arb":
+        profit = opportunity.profit_percentage or 0
+        if profit >= 3.0:
+            tier = "fire"
+        elif profit >= 1.5:
+            tier = "lightning"
+        else:
+            tier = "info"
+    elif opp_type == "positive_ev":
+        ev = opportunity.ev_percentage or 0
+        if ev >= 5.0:
+            tier = "fire"
+        elif ev >= 3.0:
+            tier = "lightning"
+        else:
+            tier = "info"
+    elif opp_type == "middle":
+        gap = opportunity.middle_gap or 0
+        if gap >= 3.0:
+            tier = "fire"
+        elif gap >= 1.5:
+            tier = "lightning"
+        else:
+            tier = "info"
     else:
         tier = "info"
 
@@ -207,7 +297,6 @@ async def send_arb_alert(opportunity: ArbOpportunity) -> SlackNotificationRespon
     for leg in opportunity.legs:
         bookmaker = leg.get("bookmaker", "")
         event_id = leg.get("event_id", "")
-        # Placeholder URLs - real implementation would build actual deep links
         deep_links[bookmaker] = f"https://{bookmaker.lower()}.com/event/{event_id}"
 
     # Create alert
@@ -217,11 +306,16 @@ async def send_arb_alert(opportunity: ArbOpportunity) -> SlackNotificationRespon
         tier=tier,
         message="",  # Will be formatted
         deep_links=deep_links,
-        expires_at=datetime.utcnow() + timedelta(minutes=5),  # 5 min expiry
+        expires_at=datetime.utcnow() + timedelta(minutes=5),
     )
 
-    # Format message
-    alert.message = _format_arb_alert(alert)
+    # Format message based on opportunity type
+    if opp_type == "positive_ev":
+        alert.message = _format_positive_ev_alert(alert)
+    elif opp_type == "middle":
+        alert.message = _format_middle_alert(alert)
+    else:
+        alert.message = _format_arb_alert(alert)
 
     # Store for bet command processing
     _pending_alerts[alert.alert_id] = alert

@@ -22,12 +22,28 @@ from .adapters.base import BaseFeedAdapter
 from .adapters.generic import GenericSportsbookAdapter
 from .adapters.http_adapter import HTTPFeedAdapter
 from .adapters.intercepting_adapter import InterceptingAdapter
+from .adapters.draftkings_public_api import DraftKingsPublicAPIAdapter
+from .adapters.odds_api_adapter import OddsAPIAdapter
 
 logger = logging.getLogger(__name__)
 browser_logger = logging.getLogger("market_feed.browser.session")
 
 # Cookie storage directory
 COOKIE_DIR = Path(os.getenv("COOKIE_DIR", "/tmp/arb-desk-cookies"))
+
+# DraftKings ingestion mode flags
+# NOTE: Public API currently blocked by Akamai Bot Protection, defaulting to authenticated
+DK_USE_PUBLIC_API = os.getenv("DK_USE_PUBLIC_API", "false").lower() == "true"
+DK_USE_AUTH_API = os.getenv("DK_USE_AUTH_API", "true").lower() == "true"
+
+# The Odds API configuration (primary source for CT sportsbooks)
+USE_ODDS_API = os.getenv("USE_ODDS_API", "true").lower() == "true"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+
+# Log the environment variable values at startup
+logger.info(f"DK_USE_PUBLIC_API={DK_USE_PUBLIC_API}, DK_USE_AUTH_API={DK_USE_AUTH_API}")
+logger.info(f"USE_ODDS_API={USE_ODDS_API}, ODDS_API_KEY={'***' if ODDS_API_KEY else 'NOT_SET'}")
+
 COOKIE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -91,7 +107,12 @@ class SessionManager:
     def _create_adapter(self, bookmaker: str) -> BaseFeedAdapter:
         """Create a new adapter instance.
 
-        Priority:
+        Priority for DraftKings:
+        1. DraftKingsPublicAPIAdapter when DK_USE_PUBLIC_API=true (fastest, no auth)
+        2. HTTPFeedAdapter when cookies are available (authenticated)
+        3. InterceptingAdapter (Playwright + API interception, authenticated)
+
+        Priority for other bookmakers:
         1. HTTPFeedAdapter when cookies are available (fastest, most reliable)
         2. InterceptingAdapter for CT sportsbooks (Playwright + API interception)
         3. GenericSportsbookAdapter fallback (Selenium, legacy)
@@ -99,9 +120,41 @@ class SessionManager:
         config = self._configs[bookmaker]
         credentials = self._credentials[bookmaker]
 
+        # The Odds API: Use as primary source for CT sportsbooks when enabled
+        if USE_ODDS_API and ODDS_API_KEY and bookmaker.lower() in ["draftkings", "fanduel"]:
+            logger.info(f"[{bookmaker}] ODDS API INGESTION ACTIVE - Using OddsAPIAdapter as primary source")
+            adapter = OddsAPIAdapter(ODDS_API_KEY)
+            # Create a wrapper that implements the BaseFeedAdapter interface
+            return self._create_odds_api_wrapper(adapter, config, credentials)
+
+        # DraftKings: Use Public API adapter when enabled
+        # Read environment variables directly to avoid caching issues
+        if bookmaker.lower() == "draftkings":
+            dk_use_public = os.getenv("DK_USE_PUBLIC_API", "false").lower() == "true"
+            dk_use_auth = os.getenv("DK_USE_AUTH_API", "true").lower() == "true"
+            logger.info(f"[{bookmaker}] ENV CHECK: DK_USE_PUBLIC_API={dk_use_public}, DK_USE_AUTH_API={dk_use_auth}")
+
+            if dk_use_public:
+                logger.info(f"[{bookmaker}] DK PUBLIC INGESTION ACTIVE - Using DraftKingsPublicAPIAdapter")
+                adapter = DraftKingsPublicAPIAdapter(config, credentials)
+                adapter.initialize()
+                return adapter
+
+        # DraftKings: Skip authenticated adapters if DK_USE_AUTH_API=false
+        if bookmaker.lower() == "draftkings":
+            dk_use_auth = os.getenv("DK_USE_AUTH_API", "true").lower() == "true"
+            if not dk_use_auth:
+                logger.info(f"[{bookmaker}] DK_USE_AUTH_API=false - Skipping authenticated adapters")
+                # Return public API adapter as fallback
+                adapter = DraftKingsPublicAPIAdapter(config, credentials)
+                adapter.initialize()
+                return adapter
+
         # Prefer HTTP adapter when cookies are available
         if self._has_imported_cookies(bookmaker):
             logger.info(f"[{bookmaker}] Using HTTPFeedAdapter (cookies available)")
+            if bookmaker.lower() == "draftkings":
+                logger.info(f"[{bookmaker}] DK AUTH INGESTION ACTIVE")
             adapter = HTTPFeedAdapter(config, credentials)
             adapter.initialize()
             return adapter
@@ -111,6 +164,8 @@ class SessionManager:
         ct_books = ["fanduel", "draftkings", "fanatics"]
         if bookmaker.lower() in ct_books:
             logger.info(f"[{bookmaker}] Using InterceptingAdapter (Playwright + API interception)")
+            if bookmaker.lower() == "draftkings":
+                logger.info(f"[{bookmaker}] DK AUTH INGESTION ACTIVE")
             # InterceptingAdapter is async, but we return it here for lazy init
             # The actual browser initialization happens when login() is called
             return InterceptingAdapter(config, credentials)
@@ -285,6 +340,11 @@ class SessionManager:
         """Get status for all registered feeds."""
         return {bm: self.get_status(bm) for bm in self._configs}
     
+    def _create_odds_api_wrapper(self, odds_api_adapter: OddsAPIAdapter, config: FeedConfig, credentials: BookmakerCredentials) -> BaseFeedAdapter:
+        """Create a wrapper that makes OddsAPIAdapter compatible with BaseFeedAdapter interface."""
+        from .adapters.odds_api_wrapper import OddsAPIWrapperAdapter
+        return OddsAPIWrapperAdapter(odds_api_adapter, config, credentials)
+
     def close_all(self) -> None:
         """Close all adapter sessions."""
         with self._lock:

@@ -23,3 +23,6 @@ bezier==2023.7.28  # For realistic mouse curves
 # TLS fingerprint impersonation (bypass sportsbook API protection)
 curl_cffi==0.7.4
 
+# Cryptography for Kalshi RSA-PSS API authentication
+cryptography>=42.0.0
+

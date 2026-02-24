@@ -50,6 +50,16 @@ class ArbOpportunity(BaseModel):
     is_live: bool = False  # True if this is a live/in-play arb
     detected_at: datetime = Field(default_factory=datetime.utcnow)
     expires_estimate_seconds: Optional[int] = None  # Estimated time before odds change
+    # Opportunity type: "arb", "positive_ev", "middle"
+    opportunity_type: str = "arb"
+    # +EV specific fields
+    ev_percentage: Optional[float] = None  # Expected value % (e.g., 3.5 for 3.5% edge)
+    true_probability: Optional[float] = None  # Estimated no-vig probability
+    kelly_fraction: Optional[float] = None  # Kelly criterion suggested fraction
+    # Middle specific fields
+    middle_range: Optional[str] = None  # e.g., "4-5 points" or "211-213 total"
+    middle_gap: Optional[float] = None  # Size of the middle gap in points
+    middle_probability: Optional[float] = None  # Estimated probability of hitting the middle
 
 
 class ArbRequest(BaseModel):
@@ -298,3 +308,32 @@ class MultiAccountCredentials(BaseModel):
     credentials: List[BookmakerCredentials]
     active_index: int = 0  # Currently active credential set
     rotation_on_logout: bool = True  # Rotate when logged out by book
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Promo Converter Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PromoConvertRequest(BaseModel):
+    """Request to calculate optimal hedge for a free bet or profit boost."""
+    promo_type: str  # "free_bet" or "profit_boost"
+    amount: float  # Free bet amount (e.g., 50.0) or wager amount for boost
+    boost_percentage: Optional[float] = None  # e.g., 50 for 50% profit boost
+    odds_decimal: float  # Best odds for the promo-side bet
+    hedge_odds_decimal: float  # Best odds for the hedge bet (other book)
+    free_bet_returns_stake: bool = False  # True if free bet returns stake on win
+
+
+class PromoConvertResponse(BaseModel):
+    """Response with optimal hedge calculation for promo conversion."""
+    promo_type: str
+    promo_amount: float
+    promo_side_odds: float
+    hedge_side_odds: float
+    recommended_hedge_stake: float
+    guaranteed_profit: float
+    conversion_rate: float  # e.g., 0.70 for 70% conversion
+    promo_side_payout: float  # Payout if promo side wins
+    hedge_side_payout: float  # Payout if hedge side wins
+    notes: str = ""

@@ -38,6 +38,7 @@ from shared.schemas import (
 from shared.logging_config import setup_logging
 from .session_manager import session_manager
 from .bet_executor import BetExecutor
+from .adapters.prediction_markets import PolymarketAdapter, KalshiAdapter
 
 # Configure logging
 logger = setup_logging("market_feed")
@@ -200,6 +201,86 @@ async def _auto_poll_loop(bookmaker: str) -> None:
             return
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prediction Market Polling Loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+PRED_POLL_INTERVAL = int(os.getenv("PRED_POLL_INTERVAL", "120"))  # 2 minutes
+
+async def _prediction_market_poll_loop(market_name: str, adapter) -> None:
+    """
+    Continuous background polling loop for a prediction market.
+
+    Prediction markets change slower than live sports, so we poll less
+    frequently (default 2 min vs 45-90s for sportsbooks).
+    """
+    _poller_stats[market_name] = {
+        "started_at": datetime.utcnow().isoformat(),
+        "poll_count": 0,
+        "success_count": 0,
+        "error_count": 0,
+        "last_poll_at": None,
+        "last_error": None,
+        "next_delay": None,
+    }
+
+    # Stagger start
+    stagger = random.uniform(5, 30)
+    logger.info(f"[{market_name}] Prediction market poller starting in {stagger:.1f}s")
+    await asyncio.sleep(stagger)
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+    BASE_ERROR_BACKOFF = 60
+
+    while True:
+        poll_start = datetime.utcnow()
+        _poller_stats[market_name]["poll_count"] += 1
+        _poller_stats[market_name]["last_poll_at"] = poll_start.isoformat()
+
+        try:
+            odds = await adapter.fetch_markets()
+
+            if odds:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        f"{ODDS_INGEST_URL}/process",
+                        json=[o.model_dump(mode="json") for o in odds],
+                    )
+                    resp.raise_for_status()
+                logger.info(f"[{market_name}] Fetched {len(odds)} odds → pushed to pipeline")
+            else:
+                logger.info(f"[{market_name}] No odds available this cycle")
+
+            _poller_stats[market_name]["success_count"] += 1
+            consecutive_errors = 0
+
+        except asyncio.CancelledError:
+            logger.info(f"[{market_name}] Poller cancelled")
+            return
+        except Exception as exc:
+            consecutive_errors += 1
+            _poller_stats[market_name]["error_count"] += 1
+            _poller_stats[market_name]["last_error"] = str(exc)[:200]
+            logger.error(f"[{market_name}] Poll error ({consecutive_errors}): {exc}")
+
+        # Determine next sleep
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            backoff = min(BASE_ERROR_BACKOFF * (2 ** (consecutive_errors - MAX_CONSECUTIVE_ERRORS)), 600)
+            delay = backoff + random.uniform(0, 30)
+            logger.warning(f"[{market_name}] {consecutive_errors} errors — backing off {delay:.0f}s")
+        else:
+            delay = PRED_POLL_INTERVAL + random.uniform(-30, 30)
+
+        _poller_stats[market_name]["next_delay"] = round(delay, 1)
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            logger.info(f"[{market_name}] Poller cancelled during sleep")
+            return
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize feeds and start auto-polling loops on startup."""
@@ -231,6 +312,25 @@ async def startup_event():
             f"[{bookmaker}] Auto-poller scheduled "
             f"(interval {POLL_MIN_INTERVAL}-{POLL_MAX_INTERVAL}s randomized)"
         )
+
+    # ── Prediction Market Pollers ──────────────────────────────────────────
+    if os.getenv("POLYMARKET_ENABLED", "false").lower() == "true":
+        poly_adapter = PolymarketAdapter()
+        task = asyncio.create_task(
+            _prediction_market_poll_loop("polymarket", poly_adapter),
+            name="auto_poll_polymarket",
+        )
+        _poller_tasks["polymarket"] = task
+        logger.info("[polymarket] Auto-poller scheduled (prediction market, ~2min interval)")
+
+    if os.getenv("KALSHI_ENABLED", "false").lower() == "true":
+        kalshi_adapter = KalshiAdapter()
+        task = asyncio.create_task(
+            _prediction_market_poll_loop("kalshi", kalshi_adapter),
+            name="auto_poll_kalshi",
+        )
+        _poller_tasks["kalshi"] = task
+        logger.info("[kalshi] Auto-poller scheduled (prediction market, ~2min interval)")
 
     if _poller_tasks:
         logger.info(

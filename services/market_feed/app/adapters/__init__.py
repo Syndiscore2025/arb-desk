@@ -32,6 +32,9 @@ from .odds_api_adapter import OddsAPIAdapter
 # API interception adapter (real-time live odds)
 from .intercepting_adapter import InterceptingAdapter
 
+# DraftKings Public API adapter (unauthenticated)
+from .draftkings_public_api import DraftKingsPublicAPIAdapter
+
 __all__ = [
     "BaseFeedAdapter",
     "GenericSportsbookAdapter",
@@ -54,5 +57,7 @@ __all__ = [
     "OddsAPIAdapter",
     # API interception (live odds)
     "InterceptingAdapter",
+    # DraftKings Public API (unauthenticated)
+    "DraftKingsPublicAPIAdapter",
 ]
 

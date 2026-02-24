@@ -37,11 +37,21 @@ def ingest_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
 
 @app.post("/process", response_model=OddsIngestResponse)
 def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
+    """
+    Process odds through the full pipeline:
+    1. Detect arbitrage opportunities
+    2. Detect +EV opportunities
+    3. Detect middle opportunities
+    4. Route all actionable opportunities through decision_gateway
+    5. Send alerts to slack_notifier
+    """
     if not payload:
         return OddsIngestResponse(accepted=0, dropped=0)
 
     arb_request = ArbRequest(odds=payload)
+    all_opportunities = []
 
+    # 1. Detect arbitrage opportunities
     try:
         with httpx.Client(timeout=10.0) as client:
             arb_response = client.post(
@@ -50,17 +60,47 @@ def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
             )
             arb_response.raise_for_status()
             arb_data = arb_response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail="arb_math request failed") from exc
+            arb_opps = [opp for opp in arb_data.get("opportunities", []) if opp.get("has_arb")]
+            all_opportunities.extend(arb_opps)
+    except Exception:
+        pass  # Continue with other opportunity types
 
-    opportunities = arb_data.get("opportunities", [])
-    positives = [opp for opp in opportunities if opp.get("has_arb")]
+    # 2. Detect +EV opportunities
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            ev_response = client.post(
+                f"{ARB_MATH_URL}/positive-ev",
+                json=arb_request.model_dump(mode="json"),
+            )
+            ev_response.raise_for_status()
+            ev_data = ev_response.json()
+            ev_opps = ev_data.get("opportunities", [])
+            all_opportunities.extend(ev_opps)
+    except Exception:
+        pass  # Continue with other opportunity types
 
-    if not positives:
+    # 3. Detect middle opportunities
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            middle_response = client.post(
+                f"{ARB_MATH_URL}/middles",
+                json=arb_request.model_dump(mode="json"),
+            )
+            middle_response.raise_for_status()
+            middle_data = middle_response.json()
+            middle_opps = middle_data.get("opportunities", [])
+            all_opportunities.extend(middle_opps)
+    except Exception:
+        pass  # Continue
+
+    if not all_opportunities:
         return OddsIngestResponse(accepted=len(payload), dropped=0)
 
-    actionable = []
-    for opp in positives:
+    # 4. Route through decision gateway and send alerts
+    for opp in all_opportunities:
+        opp_type = opp.get("opportunity_type", "arb")
+
+        # Get decision from gateway
         try:
             with httpx.Client(timeout=10.0) as client:
                 decision_response = client.post(
@@ -70,27 +110,19 @@ def process_odds(payload: List[MarketOdds]) -> OddsIngestResponse:
                 decision_response.raise_for_status()
                 decision_data = decision_response.json()
                 decision = decision_data.get("decision", "manual_review")
-                rationale = decision_data.get("rationale", "No rationale provided.")
         except Exception:
             decision = "manual_review"
-            rationale = "Decision gateway unavailable; manual review."
 
-        if decision not in {"ignore", "dismiss"}:
-            actionable.append((opp, decision, rationale))
+        # Skip ignored/dismissed opportunities
+        if decision in {"ignore", "dismiss"}:
+            continue
 
-    for opp, decision, rationale in actionable:
-        message = (
-            f"Arb opportunity detected for event={opp.get('event_id')} "
-            f"market={opp.get('market')} "
-            f"implied_sum={opp.get('implied_prob_sum')} "
-            f"decision={decision} "
-            f"rationale={rationale}"
-        )
+        # 5. Send alert to Slack via the unified /alert/arb endpoint
         try:
             with httpx.Client(timeout=10.0) as client:
                 client.post(
-                    f"{SLACK_NOTIFIER_URL}/notify",
-                    json=SlackNotification(message=message).model_dump(mode="json"),
+                    f"{SLACK_NOTIFIER_URL}/alert/arb",
+                    json=opp,
                 )
         except Exception:
             pass

@@ -10,7 +10,10 @@ Cross-market arbitrage between prediction markets and sportsbooks.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -18,6 +21,15 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from shared.schemas import MarketOdds
+
+# Kalshi RSA-PSS imports (optional — only needed if Kalshi is enabled)
+try:
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +105,11 @@ class PolymarketAdapter:
         condition_id = market.get("conditionId", market.get("id", "unknown"))
         question = market.get("question", "Unknown")
 
-        # Get outcomes with prices
-        outcomes = market.get("outcomes", [])
-        prices = market.get("outcomePrices", [])
+        # Get outcomes with prices — Gamma API returns these as JSON strings
+        raw_outcomes = market.get("outcomes", [])
+        raw_prices = market.get("outcomePrices", [])
+        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else (raw_outcomes or [])
+        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
 
         for i, outcome in enumerate(outcomes):
             if i >= len(prices):
@@ -126,7 +140,7 @@ class PolymarketAdapter:
 
     def _parse_end_date(self, market: Dict) -> Optional[datetime]:
         """Parse market end date."""
-        end_str = market.get("endDateIso")
+        end_str = market.get("endDateIso") or market.get("endDate")
         if end_str:
             try:
                 return datetime.fromisoformat(end_str.replace("Z", "+00:00"))
@@ -155,62 +169,137 @@ class KalshiAdapter:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
-        self.use_demo = config.get("use_demo", False)
+        self.use_demo = self.config.get("use_demo", False)
         self.base_url = self.DEMO_URL if self.use_demo else self.BASE_URL
         self.client = httpx.AsyncClient(timeout=30)
 
+        # Load API key and private key for RSA-PSS authentication
+        self.api_key = os.getenv("KALSHI_API_KEY")
+        private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+
+        self.private_key = None
+        if private_key_path and os.path.exists(private_key_path):
+            if not _HAS_CRYPTO:
+                logger.error("[Kalshi] cryptography package not installed — cannot authenticate")
+            else:
+                try:
+                    with open(private_key_path, "rb") as key_file:
+                        self.private_key = serialization.load_pem_private_key(
+                            key_file.read(),
+                            password=None,
+                            backend=default_backend(),
+                        )
+                    logger.info("[Kalshi] RSA private key loaded successfully")
+                except Exception as e:
+                    logger.error(f"[Kalshi] Failed to load private key: {e}")
+        else:
+            if not private_key_path:
+                logger.warning("[Kalshi] KALSHI_PRIVATE_KEY_PATH not set")
+            elif not os.path.exists(private_key_path):
+                logger.warning(f"[Kalshi] Key file not found: {private_key_path}")
+
+    # ── RSA-PSS Signing ────────────────────────────────────────────────────
+
+    def _sign_request(self, method: str, path: str) -> tuple:
+        """
+        Create RSA-PSS signature for a Kalshi API request.
+
+        Kalshi auth headers:
+          KALSHI-ACCESS-KEY       – API key id
+          KALSHI-ACCESS-TIMESTAMP – current epoch ms
+          KALSHI-ACCESS-SIGNATURE – base64(RSA-PSS(timestamp + METHOD + path_no_query))
+
+        Returns:
+            (signature_b64, timestamp_str)
+        """
+        if not self.private_key:
+            raise RuntimeError("Kalshi private key not loaded — cannot sign request")
+
+        timestamp = str(int(datetime.utcnow().timestamp() * 1000))
+        path_without_query = path.split("?")[0]
+        message = f"{timestamp}{method.upper()}{path_without_query}".encode("utf-8")
+
+        signature = self.private_key.sign(
+            message,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("utf-8"), timestamp
+
+    def _auth_headers(self, method: str, path: str) -> Dict[str, str]:
+        """Return Kalshi auth headers dict (or empty if keys missing)."""
+        if not self.api_key or not self.private_key:
+            return {}
+        try:
+            sig, ts = self._sign_request(method, path)
+            return {
+                "KALSHI-ACCESS-KEY": self.api_key,
+                "KALSHI-ACCESS-SIGNATURE": sig,
+                "KALSHI-ACCESS-TIMESTAMP": ts,
+            }
+        except Exception as e:
+            logger.error(f"[Kalshi] Failed to sign request: {e}")
+            return {}
+
+    # ── Market Fetching ────────────────────────────────────────────────────
+
+    # All sport series tickers we care about
+    SPORT_SERIES = {
+        "basketball_nba": "KXNBA",
+        "americanfootball_nfl": "KXNFL",
+        "baseball_mlb": "KXMLB",
+        "icehockey_nhl": "KXNHL",
+    }
+
     async def fetch_markets(self, sport: Optional[str] = None) -> List[MarketOdds]:
-        """Fetch all active markets from Kalshi."""
+        """Fetch open markets from Kalshi (public endpoint, no auth needed).
+
+        When sport is None, fetches ALL sport series (NBA, NFL, MLB, NHL).
+        The default /markets endpoint returns mostly MVE parlay markets with
+        zero prices, so we must query by series_ticker explicitly.
+        """
         odds_list: List[MarketOdds] = []
 
-        try:
-            # Fetch events
-            response = await self.client.get(
-                f"{self.base_url}/events",
-                params={"status": "active"}
-            )
-            response.raise_for_status()
-            data = response.json()
-            events = data.get("events", [])
+        # Determine which series to fetch
+        if sport and sport.lower() in self.SPORT_SERIES:
+            series_to_fetch = {sport.lower(): self.SPORT_SERIES[sport.lower()]}
+        else:
+            # Fetch ALL sport series
+            series_to_fetch = dict(self.SPORT_SERIES)
 
-            for event in events:
-                # Filter by sport if specified
-                category = event.get("category", "").lower()
-                if sport and sport.lower() not in category:
-                    continue
+        for sport_key, series_ticker in series_to_fetch.items():
+            try:
+                params: Dict[str, Any] = {
+                    "status": "open",
+                    "limit": 200,
+                    "series_ticker": series_ticker,
+                }
 
-                # Fetch markets for this event
-                event_ticker = event.get("event_ticker")
-                if event_ticker:
-                    markets = await self._fetch_event_markets(event_ticker)
-                    odds_list.extend(markets)
+                response = await self.client.get(
+                    f"{self.base_url}/markets",
+                    params=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+                markets = data.get("markets", [])
 
-        except Exception as e:
-            logger.error(f"[Kalshi] Failed to fetch markets: {e}")
+                for market in markets:
+                    # Skip multivariate (parlay) markets — too complex for arb
+                    if market.get("ticker", "").startswith("KXMVE"):
+                        continue
+
+                    market_odds = self._parse_market(market)
+                    odds_list.extend(market_odds)
+
+                logger.debug(f"[Kalshi] {series_ticker}: {len(markets)} markets")
+
+            except Exception as e:
+                logger.error(f"[Kalshi] Failed to fetch {series_ticker}: {e}")
 
         logger.info(f"[Kalshi] Fetched {len(odds_list)} market odds")
-        return odds_list
-
-    async def _fetch_event_markets(self, event_ticker: str) -> List[MarketOdds]:
-        """Fetch markets for a specific event."""
-        odds_list = []
-
-        try:
-            response = await self.client.get(
-                f"{self.base_url}/markets",
-                params={"event_ticker": event_ticker, "status": "active"}
-            )
-            response.raise_for_status()
-            data = response.json()
-            markets = data.get("markets", [])
-
-            for market in markets:
-                market_odds = self._parse_market(market)
-                odds_list.extend(market_odds)
-
-        except Exception as e:
-            logger.warning(f"[Kalshi] Failed to fetch markets for {event_ticker}: {e}")
-
         return odds_list
 
     def _parse_market(self, market: Dict) -> List[MarketOdds]:

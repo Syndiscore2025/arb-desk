@@ -145,6 +145,11 @@ services:
       LOG_DIR: /var/log/arb-desk
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      # Prediction markets
+      POLYMARKET_ENABLED: ${POLYMARKET_ENABLED:-false}
+      KALSHI_ENABLED: ${KALSHI_ENABLED:-false}
+      KALSHI_API_KEY: ${KALSHI_API_KEY:-}
+      KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH:-/app/secrets/kalshi.key}
     depends_on:
       odds_ingest:
         condition: service_healthy
@@ -152,6 +157,7 @@ services:
       - "127.0.0.1:8006:8000"
     volumes:
       - arb-logs:/var/log/arb-desk
+      - ./secrets:/app/secrets:ro
     # Chrome needs shared memory
     shm_size: '2gb'
     healthcheck:

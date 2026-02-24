@@ -44,6 +44,9 @@ htmlcov/
 .env
 .env.local
 
+# Secrets (API keys, private keys)
+secrets/
+
 # Logs
 *.log
 logs/

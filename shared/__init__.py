@@ -9,6 +9,8 @@ from .schemas import (
     ObserveRequest,
     ObserveResponse,
     OddsIngestResponse,
+    PromoConvertRequest,
+    PromoConvertResponse,
     SlackNotification,
     SlackNotificationResponse,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "ObserveRequest",
     "ObserveResponse",
     "OddsIngestResponse",
+    "PromoConvertRequest",
+    "PromoConvertResponse",
     "SlackNotification",
     "SlackNotificationResponse",
 ]
