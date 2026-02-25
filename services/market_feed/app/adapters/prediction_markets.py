@@ -256,6 +256,11 @@ class KalshiAdapter:
         }
         self._global_markets_cursor: Optional[str] = None
 
+        # Event-based market discovery cache (captures non-sports markets with
+        # status=active that the global status=open query misses).
+        self._event_markets_cache: List[MarketOdds] = []
+        self._event_markets_fetched_at: float = 0.0
+
         # Load API key and private key for RSA-PSS authentication
         self.api_key = os.getenv("KALSHI_API_KEY")
         private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
@@ -425,6 +430,27 @@ class KalshiAdapter:
 
         # Default: global open markets, excluding MVEs (parlays)
         odds_list = await self._fetch_open_markets_global()
+        global_count = len(odds_list)
+
+        # Also fetch non-sports markets via event discovery (politics,
+        # entertainment, world events, economics, science, climate).
+        # These have status=active and are invisible to the status=open query.
+        try:
+            event_odds = await self._fetch_event_based_markets()
+            if event_odds:
+                # Merge & deduplicate: event-based markets take priority when
+                # the same ticker appears in both sets (unlikely but safe).
+                existing_ids = {o.event_id for o in odds_list}
+                new_event = [o for o in event_odds if o.event_id not in existing_ids]
+                odds_list.extend(new_event)
+                logger.info(
+                    f"[Kalshi] Fetched {len(odds_list)} market odds "
+                    f"({global_count} global open + {len(new_event)} event-based)"
+                )
+                return odds_list
+        except Exception as e:
+            logger.warning(f"[Kalshi] Event-based market fetch failed (non-fatal): {e}")
+
         if odds_list:
             logger.info(f"[Kalshi] Fetched {len(odds_list)} market odds (global open, mve_filter=exclude)")
             return odds_list
@@ -510,6 +536,148 @@ class KalshiAdapter:
             self._global_markets_cursor = None if hit_end else cursor
 
         return odds_list
+
+    # Event ticker prefixes to skip in event-based discovery.
+    # Sports: already covered by the ``status=open`` global query.
+    # Elections: state-by-state political races with hundreds of events
+    #   (mostly ``status=initialized``), not useful for cross-market arb.
+    _SKIP_EVENT_PREFIXES = (
+        # Sports / esports
+        "KXNBA", "KXNFL", "KXMLB", "KXNHL", "KXMMA", "KXSOCCER",
+        "KXNCAAB", "KXNCAAF", "KXPGA", "KXTENNIS", "KXWNBA", "KXMLS",
+        "KXESPORT", "KXLOL", "KXCSGO", "KXDOTA", "KXVALORANT", "KXCOD",
+        # State-by-state political races (SENATEAL-28, GOVERNORCA-28, etc.)
+        "SENATE", "GOVERNOR", "GOVPARTY", "HOUSE", "AGPARTY",
+        "KXSENATE", "KXGOVERNOR", "KXGOVPARTY", "KXHOUSE", "KXAGPARTY",
+    )
+
+    # Hard cap on events to query per cycle (even after prefix filtering).
+    _MAX_EVENTS_PER_CYCLE = 100
+
+    async def _fetch_event_based_markets(self) -> List[MarketOdds]:
+        """Fetch non-sports markets via event discovery.
+
+        Kalshi's ``/markets?status=open`` returns only sports/esports.
+        Politics, entertainment, world-events, economics, science and climate
+        markets have ``status=active`` and are invisible to that query.
+
+        Strategy:
+        1. ``GET /events`` → discover event tickers (1–2 API calls).
+        2. Filter out sports event prefixes (already covered by status=open).
+        3. For each remaining event, ``GET /markets?event_ticker=X`` and keep
+           only ``active`` / ``open`` markets.
+
+        Results are cached with a configurable TTL (default 10 min).
+        """
+        ttl = int(os.getenv("KALSHI_EVENT_MARKETS_CACHE_TTL_SECONDS", "600"))
+        now = time.time()
+        if self._event_markets_cache and (now - self._event_markets_fetched_at) < ttl:
+            return list(self._event_markets_cache)
+
+        # --- Step 1: discover event tickers ---
+        event_tickers: List[str] = []
+        cursor: Optional[str] = None
+        ev_limit = 200
+        max_ev_pages = 5
+
+        try:
+            for _ in range(max_ev_pages):
+                params: Dict[str, Any] = {"limit": ev_limit}
+                if cursor:
+                    params["cursor"] = cursor
+                data = await self._get_json("/events", params=params)
+                if not data:
+                    break
+                events = data.get("events", [])
+                if not isinstance(events, list) or not events:
+                    break
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    ticker = ev.get("event_ticker") or ev.get("ticker") or ""
+                    if not ticker:
+                        continue
+                    t_upper = str(ticker).upper()
+                    # Skip MVE (parlay) events
+                    if t_upper.startswith("KXMVE"):
+                        continue
+                    # Skip sports + state-level political race events
+                    if any(t_upper.startswith(p) for p in self._SKIP_EVENT_PREFIXES):
+                        continue
+                    event_tickers.append(str(ticker))
+                    if len(event_tickers) >= self._MAX_EVENTS_PER_CYCLE:
+                        break
+                if len(event_tickers) >= self._MAX_EVENTS_PER_CYCLE:
+                    break
+                cursor = data.get("cursor") or data.get("next_cursor") or data.get("next")
+                if not cursor or len(events) < ev_limit:
+                    break
+        except Exception as e:
+            logger.error(f"[Kalshi] Event discovery failed: {e}")
+
+        if not event_tickers:
+            return []
+
+        logger.info(
+            f"[Kalshi] Discovered {len(event_tickers)} non-sports events for market lookup"
+        )
+
+        # --- Step 2: fetch markets for each event (low concurrency) ---
+        odds_list: List[MarketOdds] = []
+        concurrency = int(os.getenv("KALSHI_EVENT_CONCURRENCY", "2"))
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _fetch_event_markets(ev_ticker: str) -> List[MarketOdds]:
+            async with sem:
+                try:
+                    params_m: Dict[str, Any] = {
+                        "event_ticker": ev_ticker,
+                        "mve_filter": "exclude",
+                        "limit": 100,
+                    }
+                    data_m = await self._get_json("/markets", params=params_m)
+                    if not data_m:
+                        return []
+                    markets = data_m.get("markets", [])
+                    if not isinstance(markets, list):
+                        return []
+                    result: List[MarketOdds] = []
+                    for mkt in markets:
+                        if not isinstance(mkt, dict):
+                            continue
+                        status = str(mkt.get("status", "")).lower()
+                        if status not in {"open", "active"}:
+                            continue
+                        if str(mkt.get("ticker", "")).startswith("KXMVE"):
+                            continue
+                        if str(mkt.get("market_type", "")).lower() not in {"binary", ""}:
+                            continue
+                        result.extend(self._parse_market(mkt))
+                    return result
+                except Exception as e:
+                    logger.debug(f"[Kalshi] Failed to fetch event {ev_ticker}: {e}")
+                    return []
+
+        tasks = [asyncio.create_task(_fetch_event_markets(t)) for t in event_tickers]
+        for res in await asyncio.gather(*tasks):
+            odds_list.extend(res)
+
+        # De-duplicate by event_id (first seen wins)
+        seen: set = set()
+        deduped: List[MarketOdds] = []
+        for o in odds_list:
+            if o.event_id in seen:
+                continue
+            seen.add(o.event_id)
+            deduped.append(o)
+
+        self._event_markets_cache = deduped
+        self._event_markets_fetched_at = time.time()
+        logger.info(
+            f"[Kalshi] Fetched {len(deduped)} event-based market odds "
+            f"({len(event_tickers)} non-sports events)"
+        )
+        return list(deduped)
 
     async def _get_series_tickers_for_poll(self) -> List[str]:
         """Return a rotating slice of discovered series tickers for this poll cycle."""
