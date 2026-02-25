@@ -646,6 +646,149 @@ def start_poller(bookmaker: str) -> Dict:
     return {"bookmaker": bookmaker, "message": "Poller started"}
 
 
+# ── Prediction-Market Diagnostics ──────────────────────────────────────────
+
+_TOPIC_KEYWORDS: Dict[str, List[str]] = {
+    "politics": ["trump", "president", "election", "senate", "congress", "governor", "biden",
+                 "republican", "democrat", "vote", "impeach", "cabinet", "veto", "pardon"],
+    "crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "dogecoin"],
+    "sports": ["nba", "nfl", "mlb", "nhl", "ncaa", "soccer", "football", "basketball",
+               "baseball", "hockey", "tennis", "ufc", "mma", "boxing", "esports"],
+    "economics": ["tariff", "inflation", "gdp", "recession", "fed ", "interest rate",
+                  "unemployment", "jobs", "revenue", "deficit", "debt"],
+    "entertainment": ["oscar", "emmy", "grammy", "album", "movie", "gta", "game",
+                      "rihanna", "taylor", "drake", "kanye", "film"],
+    "world_events": ["ukraine", "russia", "china", "taiwan", "war", "ceasefire",
+                     "nato", "iran", "israel", "gaza"],
+    "weather": ["temperature", "hurricane", "tornado", "earthquake", "weather",
+                "climate", "wildfire", "flood"],
+    "science": ["spacex", "nasa", "mars", "moon", "fda", "vaccine", "covid", "ai ",
+                "artificial intelligence"],
+}
+
+
+@app.get("/diagnostics/overlap")
+async def diagnostics_overlap(
+    poly_limit: int = 500,
+    kalshi_limit: int = 1000,
+    top_k: int = 25,
+    min_score: float = 0.0,
+) -> Dict:
+    """
+    On-demand overlap report between Polymarket and Kalshi.
+
+    Fetches fresh data from both APIs, runs the fuzzy matcher with a *very*
+    low threshold, and returns the top candidate pairs, similarity scores,
+    and a keyword/topic breakdown per platform.
+
+    Query parameters:
+      - poly_limit  : Polymarket page size (default 500)
+      - kalshi_limit: Kalshi page size (default 1000)
+      - top_k       : Number of top candidate pairs to return (default 25)
+      - min_score   : Minimum similarity score to include (default 0.0 — all)
+    """
+    import time as _time
+
+    t0 = _time.monotonic()
+
+    # Use temporary adapters so we don't interfere with the running poll loop
+    poly = PolymarketAdapter()
+    kalshi = KalshiAdapter()
+    try:
+        poly_odds_res, kalshi_odds_res = await asyncio.gather(
+            poly.fetch_markets(),
+            kalshi.fetch_markets(),
+            return_exceptions=True,
+        )
+    finally:
+        await poly.close()
+        await kalshi.close()
+
+    errors = []
+    poly_odds: List[MarketOdds] = []
+    kalshi_odds: List[MarketOdds] = []
+    if isinstance(poly_odds_res, Exception):
+        errors.append(f"Polymarket fetch error: {poly_odds_res}")
+    else:
+        poly_odds = poly_odds_res or []
+    if isinstance(kalshi_odds_res, Exception):
+        errors.append(f"Kalshi fetch error: {kalshi_odds_res}")
+    else:
+        kalshi_odds = kalshi_odds_res or []
+
+    # Run unifier with very low threshold + debug on to capture best candidates
+    saved_debug = os.environ.get("PM_MATCH_DEBUG")
+    saved_score = os.environ.get("PM_MATCH_MIN_SCORE")
+    saved_topk = os.environ.get("PM_MATCH_DEBUG_TOPK")
+    os.environ["PM_MATCH_DEBUG"] = "true"
+    os.environ["PM_MATCH_MIN_SCORE"] = str(min_score or 0.01)
+    os.environ["PM_MATCH_DEBUG_TOPK"] = str(max(top_k, 50))
+    try:
+        diag_unifier = PredictionMarketEventUnifier()
+        unified, meta = diag_unifier.unify(poly_odds, kalshi_odds)
+    finally:
+        # Restore env vars
+        for k, v in [("PM_MATCH_DEBUG", saved_debug), ("PM_MATCH_MIN_SCORE", saved_score),
+                     ("PM_MATCH_DEBUG_TOPK", saved_topk)]:
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # Build top candidate pairs from debug state
+    top_pairs = []
+    for score, pm_title, km_title in (diag_unifier._last_debug_top or [])[:top_k]:
+        top_pairs.append({"score": round(score, 4), "polymarket": pm_title[:200], "kalshi": km_title[:200]})
+    if diag_unifier._last_best_candidate and not top_pairs:
+        bs, pm, km = diag_unifier._last_best_candidate
+        top_pairs.append({"score": round(bs, 4), "polymarket": pm[:200], "kalshi": km[:200]})
+
+    # Topic/category breakdown
+    def _categorize(titles: List[str]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for title in titles:
+            tl = title.lower()
+            matched_topic = False
+            for topic, kws in _TOPIC_KEYWORDS.items():
+                if any(kw in tl for kw in kws):
+                    counts[topic] = counts.get(topic, 0) + 1
+                    matched_topic = True
+            if not matched_topic:
+                counts["other"] = counts.get("other", 0) + 1
+        return dict(sorted(counts.items(), key=lambda x: -x[1]))
+
+    # Unique market titles per platform
+    poly_titles = list({o.market for o in poly_odds})
+    kalshi_titles = list({o.market for o in kalshi_odds})
+
+    elapsed = round(_time.monotonic() - t0, 2)
+
+    return {
+        "elapsed_seconds": elapsed,
+        "errors": errors,
+        "counts": {
+            "polymarket_odds": len(poly_odds),
+            "kalshi_odds": len(kalshi_odds),
+            "polymarket_unique_markets": len(poly_titles),
+            "kalshi_unique_markets": len(kalshi_titles),
+        },
+        "matching": {
+            "matched_pairs": meta.get("matched_pairs", 0),
+            "best_candidate_score": meta.get("best_candidate_score"),
+            "match_threshold": diag_unifier.min_match_score,
+        },
+        "top_candidate_pairs": top_pairs,
+        "topic_breakdown": {
+            "polymarket": _categorize(poly_titles),
+            "kalshi": _categorize(kalshi_titles),
+        },
+        "sample_markets": {
+            "polymarket": [t[:150] for t in poly_titles[:10]],
+            "kalshi": [t[:150] for t in kalshi_titles[:10]],
+        },
+    }
+
+
 @app.post("/scrape/{bookmaker}", response_model=ScrapeResult)
 def scrape_bookmaker(bookmaker: str) -> ScrapeResult:
     """

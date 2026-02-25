@@ -150,6 +150,7 @@ services:
       KALSHI_ENABLED: ${KALSHI_ENABLED:-false}
       KALSHI_API_KEY: ${KALSHI_API_KEY:-}
       KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH:-/app/secrets/kalshi.key}
+      PM_MATCH_DEBUG: ${PM_MATCH_DEBUG:-true}
     depends_on:
       odds_ingest:
         condition: service_healthy
