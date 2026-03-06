@@ -1,8 +1,11 @@
 """
 Tests for prediction market adapters (Polymarket, Kalshi).
 """
-import pytest
+import asyncio
 from datetime import datetime
+from pathlib import Path
+
+import pytest
 
 from shared.schemas import MarketOdds
 from services.market_feed.app.adapters.prediction_markets import (
@@ -13,6 +16,29 @@ from services.market_feed.app.adapters.prediction_markets import (
 from services.market_feed.app.prediction_market_diagnostics import (
     categorize_prediction_market_titles,
 )
+
+
+class _StubResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _make_prediction_odds(event_id: str, bookmaker: str, selection: str = "Yes") -> MarketOdds:
+    return MarketOdds(
+        event_id=event_id,
+        sport="prediction",
+        market=f"Market {event_id}",
+        bookmaker=bookmaker,
+        selection=selection,
+        odds_decimal=2.0,
+        market_type="prediction",
+    )
 
 
 class TestPolymarketLogic:
@@ -51,6 +77,45 @@ class TestPolymarketLogic:
         assert is_sports_market("sports") is True
         assert is_sports_market("NBA") is True
         assert is_sports_market("politics") is False
+
+    def test_fetch_markets_rotates_offset_between_calls(self, monkeypatch):
+        adapter = PolymarketAdapter()
+        adapter.page_limit = 2
+        adapter.max_pages = 1
+
+        offsets = []
+        payloads = {
+            0: {"markets": [{"id": "m1"}, {"id": "m2"}]},
+            2: {"markets": [{"id": "m3"}]},
+        }
+
+        async def fake_get(_url, params=None, **_kwargs):
+            offset = params.get("offset", 0)
+            offsets.append(offset)
+            return _StubResponse(payloads.get(offset, {"markets": []}))
+
+        monkeypatch.setattr(adapter.client, "get", fake_get)
+        monkeypatch.setattr(
+            adapter,
+            "_parse_market",
+            lambda market: [_make_prediction_odds(f"poly-{market['id']}", "polymarket")],
+        )
+
+        async def exercise():
+            first = await adapter.fetch_markets()
+            first_offset = adapter._next_offset
+            second = await adapter.fetch_markets()
+            second_offset = adapter._next_offset
+            await adapter.close()
+            return first, first_offset, second, second_offset
+
+        first, first_offset, second, second_offset = asyncio.run(exercise())
+
+        assert offsets == [0, 2]
+        assert len(first) == 2
+        assert len(second) == 1
+        assert first_offset == 2
+        assert second_offset == 0
 
 
 class TestKalshiLogic:
@@ -128,6 +193,89 @@ class TestKalshiLogic:
         }
 
         assert KalshiAdapter._is_non_sports_market_candidate(market) is False
+
+    def test_global_open_fetch_rotates_cursor_between_calls(self, monkeypatch):
+        monkeypatch.setenv("KALSHI_GLOBAL_MARKETS_PAGE_LIMIT", "2")
+        monkeypatch.setenv("KALSHI_GLOBAL_MAX_PAGES", "1")
+
+        adapter = KalshiAdapter()
+        cursors = []
+        payloads = {
+            None: {"markets": [{"ticker": "A"}, {"ticker": "B"}], "cursor": "next-a"},
+            "next-a": {"markets": [{"ticker": "C"}]},
+        }
+
+        async def fake_get_json(path, params=None):
+            assert path == "/markets"
+            cursor = (params or {}).get("cursor")
+            cursors.append(cursor)
+            return payloads.get(cursor, {"markets": []})
+
+        monkeypatch.setattr(adapter, "_get_json", fake_get_json)
+        monkeypatch.setattr(
+            adapter,
+            "_parse_market",
+            lambda market: [_make_prediction_odds(f"kalshi-{market['ticker']}", "kalshi")],
+        )
+
+        async def exercise():
+            first = await adapter._fetch_open_markets_global()
+            first_cursor = adapter._global_markets_cursor
+            second = await adapter._fetch_open_markets_global()
+            second_cursor = adapter._global_markets_cursor
+            await adapter.close()
+            return first, first_cursor, second, second_cursor
+
+        first, first_cursor, second, second_cursor = asyncio.run(exercise())
+
+        assert cursors == [None, "next-a"]
+        assert len(first) == 2
+        assert len(second) == 1
+        assert first_cursor == "next-a"
+        assert second_cursor is None
+
+    def test_non_sports_scan_rotates_cursor_between_refreshes(self, monkeypatch):
+        monkeypatch.setenv("KALSHI_NON_SPORTS_CACHE_TTL_SECONDS", "0")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_PAGE_LIMIT", "2")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_MAX_PAGES", "1")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_TARGET_ODDS", "10")
+
+        adapter = KalshiAdapter()
+        cursors = []
+        payloads = {
+            None: {"markets": [{"ticker": "W1"}, {"ticker": "W2"}], "cursor": "next-w"},
+            "next-w": {"markets": [{"ticker": "W3"}]},
+        }
+
+        async def fake_get_json(path, params=None):
+            assert path == "/markets"
+            cursor = (params or {}).get("cursor")
+            cursors.append(cursor)
+            return payloads.get(cursor, {"markets": []})
+
+        monkeypatch.setattr(adapter, "_get_json", fake_get_json)
+        monkeypatch.setattr(adapter, "_is_non_sports_market_candidate", lambda _market: True)
+        monkeypatch.setattr(
+            adapter,
+            "_parse_market",
+            lambda market: [_make_prediction_odds(f"kalshi-{market['ticker']}", "kalshi")],
+        )
+
+        async def exercise():
+            first = await adapter._fetch_non_sports_markets_scan()
+            first_cursor = adapter._nonsports_markets_cursor
+            second = await adapter._fetch_non_sports_markets_scan()
+            second_cursor = adapter._nonsports_markets_cursor
+            await adapter.close()
+            return first, first_cursor, second, second_cursor
+
+        first, first_cursor, second, second_cursor = asyncio.run(exercise())
+
+        assert cursors == [None, "next-w"]
+        assert len(first) == 2
+        assert len(second) == 1
+        assert first_cursor == "next-w"
+        assert second_cursor is None
 
     def test_cents_to_decimal_odds(self):
         """Convert Kalshi cents (0-100) to decimal odds."""
@@ -288,6 +436,22 @@ class TestPredictionMarketDiagnostics:
 
         assert counts["weather"] == 1
         assert counts["other"] == 1
+
+
+class TestPredictionMarketPollingSource:
+    def test_main_source_contains_combined_prediction_market_poll_loop(self):
+        source = Path("services/market_feed/app/main.py").read_text(encoding="utf-8")
+
+        assert "async def _prediction_market_combined_poll_loop" in source
+        assert "combined_odds, meta = unifier.unify(poly_odds, kalshi_odds)" in source
+        assert 'json=[o.model_dump(mode="json") for o in combined_odds]' in source
+
+    def test_main_source_schedules_combined_poller_when_both_prediction_markets_enabled(self):
+        source = Path("services/market_feed/app/main.py").read_text(encoding="utf-8")
+
+        assert "if poly_enabled and kalshi_enabled:" in source
+        assert "_prediction_market_combined_poll_loop(poly_adapter, kalshi_adapter)" in source
+        assert '_poller_tasks["prediction_markets"] = task' in source
 
     def test_weather_keyword_matching_avoids_name_substring_false_positive(self):
         counts = categorize_prediction_market_titles([
