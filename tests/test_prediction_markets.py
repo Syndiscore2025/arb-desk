@@ -7,7 +7,11 @@ from datetime import datetime
 from shared.schemas import MarketOdds
 from services.market_feed.app.adapters.prediction_markets import (
     PolymarketAdapter,
+    KalshiAdapter,
     PredictionMarketEventUnifier,
+)
+from services.market_feed.app.prediction_market_diagnostics import (
+    categorize_prediction_market_titles,
 )
 
 
@@ -51,6 +55,79 @@ class TestPolymarketLogic:
 
 class TestKalshiLogic:
     """Test Kalshi adapter logic."""
+
+    def test_dedupe_keeps_yes_and_no_for_same_event(self):
+        odds = [
+            MarketOdds(
+                event_id="kalshi-abc",
+                sport="prediction",
+                market="Will X happen?",
+                bookmaker="kalshi",
+                selection="Yes",
+                odds_decimal=2.0,
+                market_type="prediction",
+            ),
+            # Duplicate yes row (should be removed)
+            MarketOdds(
+                event_id="kalshi-abc",
+                sport="prediction",
+                market="Will X happen?",
+                bookmaker="kalshi",
+                selection="Yes",
+                odds_decimal=2.1,
+                market_type="prediction",
+            ),
+            # No row for same event (must be preserved)
+            MarketOdds(
+                event_id="kalshi-abc",
+                sport="prediction",
+                market="Will X happen?",
+                bookmaker="kalshi",
+                selection="No",
+                odds_decimal=1.9,
+                market_type="prediction",
+            ),
+        ]
+
+        deduped = KalshiAdapter._dedupe_odds_keep_sides(odds)
+        assert len(deduped) == 2
+        assert {(o.event_id, o.selection) for o in deduped} == {("kalshi-abc", "Yes"), ("kalshi-abc", "No")}
+
+    def test_weather_event_ticker_is_not_excluded_from_non_sports_discovery(self):
+        assert KalshiAdapter._is_excluded_non_sports_event_ticker("WEATHER-NYC-20260115") is False
+
+    def test_sports_event_ticker_is_excluded_from_non_sports_discovery(self):
+        assert KalshiAdapter._is_excluded_non_sports_event_ticker("KXNBA-LAL-BOS-20260115") is True
+
+    def test_open_weather_market_is_non_sports_scan_candidate(self):
+        market = {
+            "ticker": "WEATHER-NYC-20260115-HIGH-TEMP",
+            "event_ticker": "WEATHER-NYC-20260115",
+            "status": "open",
+            "market_type": "binary",
+        }
+
+        assert KalshiAdapter._is_non_sports_market_candidate(market) is True
+
+    def test_initialized_weather_market_is_not_non_sports_scan_candidate(self):
+        market = {
+            "ticker": "WEATHER-NYC-20260115-HIGH-TEMP",
+            "event_ticker": "WEATHER-NYC-20260115",
+            "status": "initialized",
+            "market_type": "binary",
+        }
+
+        assert KalshiAdapter._is_non_sports_market_candidate(market) is False
+
+    def test_sports_market_is_not_non_sports_scan_candidate(self):
+        market = {
+            "ticker": "KXNBA-LAL-BOS-20260115",
+            "event_ticker": "NBAASST-LAL-BOS-20260115",
+            "status": "open",
+            "market_type": "binary",
+        }
+
+        assert KalshiAdapter._is_non_sports_market_candidate(market) is False
 
     def test_cents_to_decimal_odds(self):
         """Convert Kalshi cents (0-100) to decimal odds."""
@@ -192,6 +269,34 @@ class TestPredictionMarketUnifier:
         assert PolymarketAdapter._normalize_yes_no("YES") == "Yes"
         assert PolymarketAdapter._normalize_yes_no("no") == "No"
         assert PolymarketAdapter._normalize_yes_no("maybe") is None
+
+
+class TestPredictionMarketDiagnostics:
+    def test_weather_titles_are_categorized(self):
+        counts = categorize_prediction_market_titles([
+            "Will NYC snowfall exceed 3 inches this week?",
+            "Will a tropical storm make landfall in Florida this month?",
+        ])
+
+        assert counts["weather"] == 2
+
+    def test_weather_keyword_matching_avoids_hail_substring_false_positive(self):
+        counts = categorize_prediction_market_titles([
+            "Project Hail Mary Rotten Tomatoes score?",
+            "Will Denver hail reach one inch this weekend?",
+        ])
+
+        assert counts["weather"] == 1
+        assert counts["other"] == 1
+
+    def test_weather_keyword_matching_avoids_name_substring_false_positive(self):
+        counts = categorize_prediction_market_titles([
+            "Mikhail Sergachev: 1+ goals",
+            "Will Chicago snowfall exceed 4 inches this weekend?",
+        ])
+
+        assert counts["weather"] == 1
+        assert counts["other"] == 1
 
 
 class TestCLVCalculation:

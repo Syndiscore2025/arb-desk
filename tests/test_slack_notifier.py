@@ -1,9 +1,236 @@
 """
-Tests for Slack notifier and bet command handling.
+Tests for Slack notifier: alert control plane, dedupe, quality gates, and bet command handling.
 """
 import pytest
 import re
 from datetime import datetime, timedelta
+
+# ---------------------------------------------------------------------------
+# Import the notifier helpers for real integration tests.  We guard against
+# import failures so the shallow tests still pass even outside Docker.
+# ---------------------------------------------------------------------------
+try:
+    import services.slack_notifier.app.main as slack_main
+
+    from services.slack_notifier.app.main import (
+        _alert_fingerprint,
+        _should_suppress_alert,
+        _record_alert_sent,
+        _record_alert_suppressed,
+        _cleanup_stale_dedupe,
+        _save_alert_state,
+        _load_alert_state,
+        _alert_state,
+        _alert_stats,
+        _alert_dedupe,
+        _alert_lifecycle,
+        _alert_send_times,
+        ALERT_STATE_PATH,
+        ALERT_COOLDOWN_SECONDS,
+        MIN_ARB_PROFIT_PCT,
+        MIN_EV_PCT,
+        MIN_MIDDLE_GAP,
+    )
+    from shared.schemas import ArbOpportunity
+
+    _NOTIFIER_AVAILABLE = True
+except Exception:
+    _NOTIFIER_AVAILABLE = False
+
+
+def _make_opp(**overrides) -> "ArbOpportunity":
+    """Helper: build a minimal ArbOpportunity for tests."""
+    defaults = dict(
+        event_id="evt_test_123",
+        market="moneyline",
+        implied_prob_sum=0.97,
+        has_arb=True,
+        profit_percentage=2.5,
+        opportunity_type="arb",
+        legs=[
+            {"bookmaker": "fanduel", "selection": "Team A", "odds_decimal": 2.10},
+            {"bookmaker": "draftkings", "selection": "Team B", "odds_decimal": 2.05},
+        ],
+    )
+    defaults.update(overrides)
+    return ArbOpportunity(**defaults)
+
+
+def _reset_state():
+    """Reset in-memory alert state between tests."""
+    _alert_state["enabled"] = True
+    _alert_state["disabled_at"] = None
+    _alert_state["disabled_by"] = None
+    _alert_dedupe.clear()
+    _alert_lifecycle.clear()
+    _alert_send_times.clear()
+    for k in _alert_stats:
+        _alert_stats[k] = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert Control Plane Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(not _NOTIFIER_AVAILABLE, reason="notifier not importable outside Docker")
+class TestAlertControlPlane:
+    """Test the alert mute/enable, dedupe, quality gate, and rate-limit logic."""
+
+    def setup_method(self):
+        _reset_state()
+
+    # -- Global mute --------------------------------------------------------
+
+    def test_mute_suppresses_alerts(self):
+        _alert_state["enabled"] = False
+        opp = _make_opp(profit_percentage=5.0)
+        reason = _should_suppress_alert(opp)
+        assert reason == "alerts_disabled"
+        assert _alert_stats["suppressed_muted"] == 1
+
+    def test_unmuted_allows_alerts(self):
+        opp = _make_opp(profit_percentage=5.0)
+        assert _should_suppress_alert(opp) is None
+
+    # -- Quality gates ------------------------------------------------------
+
+    def test_low_arb_profit_suppressed(self):
+        opp = _make_opp(profit_percentage=0.1)
+        reason = _should_suppress_alert(opp)
+        assert reason is not None
+        assert "below" in reason
+        assert _alert_stats["suppressed_quality"] == 1
+
+    def test_high_arb_profit_passes(self):
+        opp = _make_opp(profit_percentage=2.5)
+        assert _should_suppress_alert(opp) is None
+
+    def test_low_ev_suppressed(self):
+        opp = _make_opp(
+            opportunity_type="positive_ev",
+            ev_percentage=0.3,
+            profit_percentage=None,
+        )
+        reason = _should_suppress_alert(opp)
+        assert reason is not None
+        assert "ev" in reason
+
+    def test_low_middle_gap_suppressed(self):
+        opp = _make_opp(
+            opportunity_type="middle",
+            middle_gap=0.1,
+            profit_percentage=None,
+        )
+        reason = _should_suppress_alert(opp)
+        assert reason is not None
+        assert "middle" in reason
+
+    # -- Dedupe / cooldown --------------------------------------------------
+
+    def test_dedupe_suppresses_repeat(self):
+        opp = _make_opp(profit_percentage=5.0)
+        assert _should_suppress_alert(opp) is None
+        _record_alert_sent(opp)
+        reason = _should_suppress_alert(opp)
+        assert reason is not None
+        assert "dedupe" in reason
+
+    def test_dedupe_different_opp_passes(self):
+        opp1 = _make_opp(profit_percentage=5.0, event_id="evt_A")
+        opp2 = _make_opp(profit_percentage=5.0, event_id="evt_B")
+        _record_alert_sent(opp1)
+        assert _should_suppress_alert(opp2) is None
+
+    # -- Rate limit ---------------------------------------------------------
+
+    def test_rate_limit_blocks_excess(self):
+        opp = _make_opp(profit_percentage=5.0)
+        # Fill up the rate-limit window
+        for i in range(15):
+            _alert_send_times.append(datetime.utcnow())
+        reason = _should_suppress_alert(opp)
+        assert reason is not None
+        assert "rate_limit" in reason
+
+    # -- Fingerprint --------------------------------------------------------
+
+    def test_fingerprint_stable(self):
+        opp = _make_opp()
+        fp1 = _alert_fingerprint(opp)
+        fp2 = _alert_fingerprint(opp)
+        assert fp1 == fp2
+
+    def test_fingerprint_differs_for_different_event(self):
+        opp1 = _make_opp(event_id="A")
+        opp2 = _make_opp(event_id="B")
+        assert _alert_fingerprint(opp1) != _alert_fingerprint(opp2)
+
+    # -- Lifecycle tracking -------------------------------------------------
+
+    def test_record_sent_creates_entry(self):
+        opp = _make_opp()
+        _record_alert_sent(opp)
+        fp = _alert_fingerprint(opp)
+        assert fp in _alert_lifecycle
+        assert _alert_lifecycle[fp]["send_count"] == 1
+
+    def test_record_suppressed_creates_entry(self):
+        opp = _make_opp()
+        _record_alert_suppressed(opp)
+        fp = _alert_fingerprint(opp)
+        assert fp in _alert_lifecycle
+        assert _alert_lifecycle[fp]["suppressed_count"] == 1
+
+    # -- Cleanup ------------------------------------------------------------
+
+    def test_cleanup_stale_dedupe(self):
+        opp = _make_opp()
+        fp = _alert_fingerprint(opp)
+        # Backdate entry so it's stale
+        _alert_dedupe[fp] = datetime.utcnow() - timedelta(seconds=99999)
+        _cleanup_stale_dedupe()
+        assert fp not in _alert_dedupe
+
+    # -- Persistence --------------------------------------------------------
+
+    def test_save_alert_state_writes_json(self, tmp_path, monkeypatch):
+        state_path = tmp_path / "alert_state.json"
+        monkeypatch.setattr(slack_main, "ALERT_STATE_PATH", str(state_path))
+
+        _alert_state["enabled"] = False
+        _alert_state["disabled_by"] = "test"
+        opp = _make_opp(profit_percentage=5.0)
+        _record_alert_sent(opp)
+
+        assert state_path.exists()
+        data = state_path.read_text(encoding="utf-8")
+        assert '"enabled": false' in data
+        assert '"disabled_by": "test"' in data
+
+    def test_load_alert_state_restores_state(self, tmp_path, monkeypatch):
+        state_path = tmp_path / "alert_state.json"
+        monkeypatch.setattr(slack_main, "ALERT_STATE_PATH", str(state_path))
+
+        _alert_state["enabled"] = False
+        _alert_state["disabled_at"] = "2026-03-05T00:00:00"
+        _alert_state["disabled_by"] = "persisted-test"
+        opp = _make_opp(profit_percentage=5.0)
+        _record_alert_sent(opp)
+        fp = _alert_fingerprint(opp)
+
+        _reset_state()
+        assert fp not in _alert_dedupe
+        _load_alert_state()
+
+        assert _alert_state["enabled"] is False
+        assert _alert_state["disabled_by"] == "persisted-test"
+        assert fp in _alert_dedupe
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Original formatting / parsing tests (kept)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TestAlertFormatting:
@@ -16,7 +243,7 @@ class TestAlertFormatting:
             "lightning": "⚡⚡",
             "info": "ℹ️",
         }
-        
+
         assert tier_emoji["fire"] == "🔥🔥🔥"
         assert tier_emoji["lightning"] == "⚡⚡"
         assert tier_emoji["info"] == "ℹ️"
@@ -30,7 +257,7 @@ class TestAlertFormatting:
                 return "lightning"
             else:
                 return "info"
-        
+
         assert get_tier(5.0) == "fire"
         assert get_tier(3.0) == "fire"
         assert get_tier(2.9) == "lightning"
@@ -42,7 +269,7 @@ class TestAlertFormatting:
         """Test stake amount formatting."""
         def format_stake(amount: float) -> str:
             return f"${amount:.2f}"
-        
+
         assert format_stake(100) == "$100.00"
         assert format_stake(1234.5) == "$1234.50"
         assert format_stake(0.99) == "$0.99"
@@ -57,7 +284,7 @@ class TestAlertFormatting:
             }
             base = base_urls.get(bookmaker.lower(), f"https://{bookmaker}.com")
             return f"{base}/event/{event_id}"
-        
+
         assert "fanduel.com" in generate_deep_link("fanduel", "123")
         assert "draftkings.com" in generate_deep_link("draftkings", "456")
 

@@ -43,6 +43,7 @@ from .adapters.prediction_markets import (
     PolymarketAdapter,
     PredictionMarketEventUnifier,
 )
+from .prediction_market_diagnostics import categorize_prediction_market_titles
 
 # Configure logging
 logger = setup_logging("market_feed")
@@ -67,6 +68,11 @@ _submitted_2fa_codes: Dict[str, str] = {}
 _poller_tasks: Dict[str, asyncio.Task] = {}   # bookmaker -> background Task
 _poller_stats: Dict[str, Dict] = {}           # bookmaker -> runtime stats
 
+# Bookmakers whose auto-pollers are intentionally disabled (bookmaker -> reason)
+# This is used to keep the service healthy/clean when a required upstream
+# dependency (e.g., ODDS_API_KEY) is missing/invalid.
+_disabled_pollers: Dict[str, str] = {}
+
 # Track prediction-market adapter instances so we can close HTTP clients on shutdown
 _prediction_market_adapters: List[object] = []
 
@@ -77,6 +83,40 @@ POLL_MAX_INTERVAL = int(os.getenv("POLL_MAX_INTERVAL", "90"))
 POLL_STAGGER_MAX = int(os.getenv("POLL_STAGGER_MAX", "30"))
 
 app = FastAPI(title="Market Feed", version="0.1.0")
+
+
+async def _validate_odds_api_key(api_key: str) -> bool:
+    """Best-effort validation of ODDS_API_KEY.
+
+    We only use this to decide whether to *disable sportsbook auto-pollers*.
+    If validation fails for non-auth reasons (network/timeouts/etc), we do NOT
+    disable anything.
+    """
+    try:
+        # Import locally to avoid changing import order / startup side-effects
+        from .adapters.odds_api_adapter import ODDS_API_BASE_URL, SPORT_KEYS
+
+        sport_key = SPORT_KEYS.get("nfl") or "americanfootball_nfl"
+        url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": "us",
+            "markets": "h2h",
+            "bookmakers": "draftkings",
+            "oddsFormat": "decimal",
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+
+        if resp.status_code in (401, 403):
+            return False
+
+        # Treat other statuses as "unknown but not definitively invalid".
+        return True
+    except Exception as exc:
+        logger.warning(f"[odds_api] Key validation skipped (error): {exc}")
+        return True
 
 
 def _load_feed_configs() -> List[FeedConfig]:
@@ -439,11 +479,54 @@ async def startup_event():
 
     logger.info(f"Initialized {len(session_manager._configs)} feeds")
 
+    # Optionally disable sportsbook auto-pollers when ODDS_API_KEY is missing/invalid.
+    # This keeps logs clean and prevents repeated upstream 401 spam while allowing
+    # prediction-market pollers to continue running.
+    disable_on_invalid_env = os.getenv(
+        "DISABLE_SPORTSBOOK_POLLERS_ON_ODDS_API_INVALID",
+        "true",
+    ).strip().lower()
+    disable_on_invalid = disable_on_invalid_env in {"true", "1", "yes", "y"}
+    use_odds_api_env = os.getenv("USE_ODDS_API", "true").strip().lower()
+    use_odds_api = use_odds_api_env in {"true", "1", "yes", "y"}
+
+    if disable_on_invalid and use_odds_api:
+        odds_api_key = (os.getenv("ODDS_API_KEY") or "").strip()
+        odds_api_books = [
+            bm for bm in session_manager._configs.keys()
+            if bm.lower() in {"fanduel", "draftkings", "fanatics"}
+        ]
+
+        if odds_api_books:
+            if not odds_api_key:
+                for bm in odds_api_books:
+                    _disabled_pollers[bm] = "odds_api_key_missing"
+                logger.warning(
+                    "[sportsbooks] ODDS_API_KEY missing; auto-pollers disabled for: "
+                    + ", ".join(odds_api_books)
+                )
+            else:
+                is_valid = await _validate_odds_api_key(odds_api_key)
+                if not is_valid:
+                    for bm in odds_api_books:
+                        _disabled_pollers[bm] = "invalid_odds_api_key"
+                    logger.warning(
+                        "[sportsbooks] ODDS_API_KEY appears invalid (401/403); "
+                        "auto-pollers disabled for: " + ", ".join(odds_api_books)
+                    )
+
     # Launch auto-pollers for every enabled bookmaker
     for bookmaker, config in session_manager._configs.items():
         if not config.enabled:
             logger.info(f"[{bookmaker}] Feed disabled — skipping auto-poller")
             continue
+
+        if bookmaker in _disabled_pollers:
+            logger.warning(
+                f"[{bookmaker}] Auto-poller disabled ({_disabled_pollers[bookmaker]})"
+            )
+            continue
+
         task = asyncio.create_task(
             _auto_poll_loop(bookmaker),
             name=f"auto_poll_{bookmaker}",
@@ -634,6 +717,13 @@ def start_poller(bookmaker: str) -> Dict:
     """Start (or restart) the auto-poller for a specific bookmaker."""
     if bookmaker not in session_manager._configs:
         raise HTTPException(status_code=404, detail=f"Feed not found: {bookmaker}")
+
+    if bookmaker in _disabled_pollers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Auto-poller disabled for {bookmaker} ({_disabled_pollers[bookmaker]})",
+        )
+
     # Cancel existing if any
     existing = _poller_tasks.get(bookmaker)
     if existing and not existing.done():
@@ -647,24 +737,6 @@ def start_poller(bookmaker: str) -> Dict:
 
 
 # ── Prediction-Market Diagnostics ──────────────────────────────────────────
-
-_TOPIC_KEYWORDS: Dict[str, List[str]] = {
-    "politics": ["trump", "president", "election", "senate", "congress", "governor", "biden",
-                 "republican", "democrat", "vote", "impeach", "cabinet", "veto", "pardon"],
-    "crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol", "dogecoin"],
-    "sports": ["nba", "nfl", "mlb", "nhl", "ncaa", "soccer", "football", "basketball",
-               "baseball", "hockey", "tennis", "ufc", "mma", "boxing", "esports"],
-    "economics": ["tariff", "inflation", "gdp", "recession", "fed ", "interest rate",
-                  "unemployment", "jobs", "revenue", "deficit", "debt"],
-    "entertainment": ["oscar", "emmy", "grammy", "album", "movie", "gta", "game",
-                      "rihanna", "taylor", "drake", "kanye", "film"],
-    "world_events": ["ukraine", "russia", "china", "taiwan", "war", "ceasefire",
-                     "nato", "iran", "israel", "gaza"],
-    "weather": ["temperature", "hurricane", "tornado", "earthquake", "weather",
-                "climate", "wildfire", "flood"],
-    "science": ["spacex", "nasa", "mars", "moon", "fda", "vaccine", "covid", "ai ",
-                "artificial intelligence"],
-}
 
 
 @app.get("/diagnostics/overlap")
@@ -743,20 +815,6 @@ async def diagnostics_overlap(
         bs, pm, km = diag_unifier._last_best_candidate
         top_pairs.append({"score": round(bs, 4), "polymarket": pm[:200], "kalshi": km[:200]})
 
-    # Topic/category breakdown
-    def _categorize(titles: List[str]) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for title in titles:
-            tl = title.lower()
-            matched_topic = False
-            for topic, kws in _TOPIC_KEYWORDS.items():
-                if any(kw in tl for kw in kws):
-                    counts[topic] = counts.get(topic, 0) + 1
-                    matched_topic = True
-            if not matched_topic:
-                counts["other"] = counts.get("other", 0) + 1
-        return dict(sorted(counts.items(), key=lambda x: -x[1]))
-
     # Unique market titles per platform
     poly_titles = list({o.market for o in poly_odds})
     kalshi_titles = list({o.market for o in kalshi_odds})
@@ -779,8 +837,8 @@ async def diagnostics_overlap(
         },
         "top_candidate_pairs": top_pairs,
         "topic_breakdown": {
-            "polymarket": _categorize(poly_titles),
-            "kalshi": _categorize(kalshi_titles),
+            "polymarket": categorize_prediction_market_titles(poly_titles),
+            "kalshi": categorize_prediction_market_titles(kalshi_titles),
         },
         "sample_markets": {
             "polymarket": [t[:150] for t in poly_titles[:10]],

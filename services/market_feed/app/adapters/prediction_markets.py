@@ -225,6 +225,27 @@ class KalshiAdapter:
     # Kalshi event categories that overlap with sports
     SPORTS_CATEGORIES = ["sports", "nfl", "nba", "mlb", "nhl"]
 
+    @staticmethod
+    def _odds_key(o: MarketOdds) -> Tuple[str, str]:
+        """Key used for de-duplication and merge logic.
+
+        Important: include selection so we never drop one side of a binary market.
+        """
+        return (o.event_id, o.selection)
+
+    @classmethod
+    def _dedupe_odds_keep_sides(cls, odds: List[MarketOdds]) -> List[MarketOdds]:
+        """De-dupe odds while preserving both Yes/No selections for the same event."""
+        seen: set = set()
+        out: List[MarketOdds] = []
+        for o in odds:
+            k = cls._odds_key(o)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(o)
+        return out
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
         self.use_demo = self.config.get("use_demo", False)
@@ -260,6 +281,16 @@ class KalshiAdapter:
         # status=active that the global status=open query misses).
         self._event_markets_cache: List[MarketOdds] = []
         self._event_markets_fetched_at: float = 0.0
+
+        # Cursor-scan cache for non-sports markets (preferred over per-event fan-out).
+        # We scan /markets without a status filter and client-side keep only
+        # {open,active} binary, non-MVE, non-sports contracts.
+        self._nonsports_markets_cache: List[MarketOdds] = []
+        self._nonsports_markets_fetched_at: float = 0.0
+        self._rotate_nonsports_cursor = str(
+            os.getenv("KALSHI_NON_SPORTS_ROTATE_CURSOR", "true")
+        ).lower() in {"1", "true", "yes", "y", "on"}
+        self._nonsports_markets_cursor: Optional[str] = None
 
         # Load API key and private key for RSA-PSS authentication
         self.api_key = os.getenv("KALSHI_API_KEY")
@@ -432,24 +463,49 @@ class KalshiAdapter:
         odds_list = await self._fetch_open_markets_global()
         global_count = len(odds_list)
 
-        # Also fetch non-sports markets via event discovery (politics,
-        # entertainment, world events, economics, science, climate).
-        # These have status=active and are invisible to the status=open query.
+        # Also fetch non-sports markets (politics/entertainment/world/econ/science/etc.)
+        # that are typically status=active and therefore invisible to status=open.
+        # Preferred method is a cursor-based /markets scan to avoid per-event fan-out.
+        mode = str(os.getenv("KALSHI_NON_SPORTS_DISCOVERY_MODE", "scan")).strip().lower()
+        fallback_to_events = str(
+            os.getenv("KALSHI_NON_SPORTS_FALLBACK_TO_EVENTS", "false")
+        ).lower() in {"1", "true", "yes", "y", "on"}
+
+        async def _merge_extra(extra: List[MarketOdds], label: str) -> int:
+            if not extra:
+                return 0
+            existing_keys = {self._odds_key(o) for o in odds_list}
+            to_add = [o for o in extra if self._odds_key(o) not in existing_keys]
+            odds_list.extend(to_add)
+            logger.info(
+                f"[Kalshi] Fetched {len(odds_list)} market odds "
+                f"({global_count} global open + {len(to_add)} {label})"
+            )
+            return len(to_add)
+
         try:
-            event_odds = await self._fetch_event_based_markets()
-            if event_odds:
-                # Merge & deduplicate: event-based markets take priority when
-                # the same ticker appears in both sets (unlikely but safe).
-                existing_ids = {o.event_id for o in odds_list}
-                new_event = [o for o in event_odds if o.event_id not in existing_ids]
-                odds_list.extend(new_event)
-                logger.info(
-                    f"[Kalshi] Fetched {len(odds_list)} market odds "
-                    f"({global_count} global open + {len(new_event)} event-based)"
-                )
-                return odds_list
+            if mode in {"off", "none", "false", "0"}:
+                pass
+            elif mode == "events":
+                added = await _merge_extra(await self._fetch_event_based_markets(), "event-based")
+                if added:
+                    return odds_list
+            else:
+                # default: scan
+                added = await _merge_extra(await self._fetch_non_sports_markets_scan(), "non-sports")
+                if added:
+                    return odds_list
         except Exception as e:
-            logger.warning(f"[Kalshi] Event-based market fetch failed (non-fatal): {e}")
+            logger.warning(f"[Kalshi] Non-sports market fetch failed (non-fatal): {e}")
+
+        # Optional fallback to event discovery if scan yields nothing.
+        if fallback_to_events and mode not in {"events", "off", "none", "false", "0"}:
+            try:
+                added = await _merge_extra(await self._fetch_event_based_markets(), "event-based")
+                if added:
+                    return odds_list
+            except Exception as e:
+                logger.warning(f"[Kalshi] Event-based fallback failed (non-fatal): {e}")
 
         if odds_list:
             logger.info(f"[Kalshi] Fetched {len(odds_list)} market odds (global open, mve_filter=exclude)")
@@ -537,6 +593,88 @@ class KalshiAdapter:
 
         return odds_list
 
+    async def _fetch_non_sports_markets_scan(self) -> List[MarketOdds]:
+        """Fetch non-sports markets via cursor-paginated /markets scan.
+
+        This avoids per-event fan-out (which tends to cause 429 rate limiting).
+        We do a limited scan of /markets without a status filter and keep only:
+        - non-MVE tickers
+        - binary markets
+        - status in {active, open} so we also capture open non-sports contracts
+          that may not appear in the current global status=open page slice
+        - tickers/events not matching known sports/esports prefixes
+
+        Results are cached with a configurable TTL (default 10 min).
+        """
+        ttl = int(os.getenv("KALSHI_NON_SPORTS_CACHE_TTL_SECONDS", "600"))
+        now = time.time()
+        if self._nonsports_markets_cache and (now - self._nonsports_markets_fetched_at) < ttl:
+            return list(self._nonsports_markets_cache)
+
+        limit = int(os.getenv("KALSHI_NON_SPORTS_PAGE_LIMIT", "1000"))
+        limit = max(1, min(limit, 1000))
+        # Default higher than global-open pagination because the unfiltered
+        # /markets listing tends to be dominated by sports/open markets first.
+        max_pages = int(os.getenv("KALSHI_NON_SPORTS_MAX_PAGES", "15"))
+        max_pages = max(1, max_pages)
+        target_odds = int(os.getenv("KALSHI_NON_SPORTS_TARGET_ODDS", "1200"))
+        target_odds = max(1, target_odds)
+
+        cursor: Optional[str] = self._nonsports_markets_cursor if self._rotate_nonsports_cursor else None
+        odds_list: List[MarketOdds] = []
+        page_count = 0
+        hit_end = False
+
+        while True:
+            page_count += 1
+            params: Dict[str, Any] = {
+                "limit": limit,
+                "mve_filter": "exclude",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            data = await self._get_json("/markets", params=params)
+            if not data:
+                hit_end = True
+                break
+
+            markets = data.get("markets", [])
+            if not isinstance(markets, list) or not markets:
+                hit_end = True
+                break
+
+            for market in markets:
+                if not self._is_non_sports_market_candidate(market):
+                    continue
+
+                odds_list.extend(self._parse_market(market))
+                if len(odds_list) >= target_odds:
+                    break
+
+            cursor = data.get("cursor") or data.get("next_cursor") or data.get("next")
+            if page_count >= max_pages:
+                break
+            if not cursor or len(markets) < limit:
+                hit_end = True
+                break
+            if len(odds_list) >= target_odds:
+                break
+
+        # Persist cursor across refreshes so we don't keep scanning the same first pages.
+        if self._rotate_nonsports_cursor:
+            self._nonsports_markets_cursor = None if hit_end else cursor
+
+        deduped = self._dedupe_odds_keep_sides(odds_list)
+
+        self._nonsports_markets_cache = deduped
+        self._nonsports_markets_fetched_at = time.time()
+        logger.info(
+            f"[Kalshi] Fetched {len(deduped)} non-sports market odds via /markets scan "
+            f"(pages={page_count}, hit_end={hit_end})"
+        )
+        return list(deduped)
+
     # Event ticker prefixes to skip in event-based discovery.
     # Sports: already covered by the ``status=open`` global query.
     # Elections: state-by-state political races with hundreds of events
@@ -550,6 +688,38 @@ class KalshiAdapter:
         "SENATE", "GOVERNOR", "GOVPARTY", "HOUSE", "AGPARTY",
         "KXSENATE", "KXGOVERNOR", "KXGOVPARTY", "KXHOUSE", "KXAGPARTY",
     )
+
+    @classmethod
+    def _is_excluded_non_sports_event_ticker(cls, ticker: Any) -> bool:
+        """Return True for tickers we intentionally exclude from non-sports discovery."""
+        ticker_upper = str(ticker or "").upper()
+        return ticker_upper.startswith("KXMVE") or any(
+            ticker_upper.startswith(prefix) for prefix in cls._SKIP_EVENT_PREFIXES
+        )
+
+    @classmethod
+    def _is_non_sports_market_candidate(cls, market: Dict[str, Any]) -> bool:
+        """Return True if a Kalshi market should be included in non-sports discovery."""
+        if not isinstance(market, dict):
+            return False
+
+        status = str(market.get("status", "")).lower()
+        if status not in {"active", "open"}:
+            return False
+
+        if str(market.get("market_type", "")).lower() not in {"binary", ""}:
+            return False
+
+        # IMPORTANT: do not rely solely on event_ticker; sports markets often
+        # have event_ticker without the KX* sport prefix (e.g. NBAASST-...),
+        # while the market ticker does include it.
+        ticker_upper = str(market.get("ticker", "")).upper()
+        ev_upper = str(market.get("event_ticker", "")).upper()
+
+        return not (
+            cls._is_excluded_non_sports_event_ticker(ticker_upper)
+            or cls._is_excluded_non_sports_event_ticker(ev_upper)
+        )
 
     # Hard cap on events to query per cycle (even after prefix filtering).
     _MAX_EVENTS_PER_CYCLE = 100
@@ -597,12 +767,7 @@ class KalshiAdapter:
                     ticker = ev.get("event_ticker") or ev.get("ticker") or ""
                     if not ticker:
                         continue
-                    t_upper = str(ticker).upper()
-                    # Skip MVE (parlay) events
-                    if t_upper.startswith("KXMVE"):
-                        continue
-                    # Skip sports + state-level political race events
-                    if any(t_upper.startswith(p) for p in self._SKIP_EVENT_PREFIXES):
+                    if self._is_excluded_non_sports_event_ticker(ticker):
                         continue
                     event_tickers.append(str(ticker))
                     if len(event_tickers) >= self._MAX_EVENTS_PER_CYCLE:
@@ -643,14 +808,7 @@ class KalshiAdapter:
                         return []
                     result: List[MarketOdds] = []
                     for mkt in markets:
-                        if not isinstance(mkt, dict):
-                            continue
-                        status = str(mkt.get("status", "")).lower()
-                        if status not in {"open", "active"}:
-                            continue
-                        if str(mkt.get("ticker", "")).startswith("KXMVE"):
-                            continue
-                        if str(mkt.get("market_type", "")).lower() not in {"binary", ""}:
+                        if not self._is_non_sports_market_candidate(mkt):
                             continue
                         result.extend(self._parse_market(mkt))
                     return result
@@ -662,14 +820,7 @@ class KalshiAdapter:
         for res in await asyncio.gather(*tasks):
             odds_list.extend(res)
 
-        # De-duplicate by event_id (first seen wins)
-        seen: set = set()
-        deduped: List[MarketOdds] = []
-        for o in odds_list:
-            if o.event_id in seen:
-                continue
-            seen.add(o.event_id)
-            deduped.append(o)
+        deduped = self._dedupe_odds_keep_sides(odds_list)
 
         self._event_markets_cache = deduped
         self._event_markets_fetched_at = time.time()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import re
 import threading
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import docker
 import httpx
@@ -33,6 +34,7 @@ DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL")
 MARKET_FEED_URL = os.getenv("MARKET_FEED_URL", "http://market_feed:8000")
 DECISION_GATEWAY_URL = os.getenv("DECISION_GATEWAY_URL", "http://decision_gateway:8000")
 COMPOSE_PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "arb-desk")
+ALERT_STATE_PATH = os.getenv("ALERT_STATE_PATH", "/app/data/alert_state.json")
 
 # Docker client for service control
 try:
@@ -71,6 +73,258 @@ TIER_EMOJI = {
     "lightning": "⚡⚡",
     "info": "ℹ️",
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert Control Plane + Dedupe/Cooldown/Lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Global alert enable/disable (env default, runtime-togglable)
+ALERTS_ENABLED_DEFAULT = os.getenv("ALERTS_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Dedupe cooldown window in seconds (env-configurable)
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
+
+# Minimum quality gates (env-configurable, per opportunity type)
+MIN_ARB_PROFIT_PCT = float(os.getenv("MIN_ARB_PROFIT_PCT", "0.5"))
+MIN_EV_PCT = float(os.getenv("MIN_EV_PCT", "1.0"))
+MIN_MIDDLE_GAP = float(os.getenv("MIN_MIDDLE_GAP", "0.5"))
+
+# Max alerts per minute (rate limiter)
+ALERT_RATE_LIMIT_PER_MINUTE = int(os.getenv("ALERT_RATE_LIMIT_PER_MINUTE", "10"))
+
+# Runtime alert state — all in-memory, survives across requests but not restarts
+_alert_state: Dict[str, Any] = {
+    "enabled": ALERTS_ENABLED_DEFAULT,
+    "disabled_at": None,
+    "disabled_by": None,
+}
+
+# Dedupe: fingerprint -> last_sent_at
+_alert_dedupe: Dict[str, datetime] = {}
+
+# Lifecycle tracking: fingerprint -> stats
+_alert_lifecycle: Dict[str, Dict[str, Any]] = {}
+
+# Rate limiter: list of send timestamps in the last 60s
+_alert_send_times: List[datetime] = []
+
+# Counters for observability
+_alert_stats: Dict[str, int] = {
+    "total_received": 0,
+    "total_sent": 0,
+    "suppressed_muted": 0,
+    "suppressed_dedupe": 0,
+    "suppressed_quality": 0,
+    "suppressed_rate_limit": 0,
+}
+
+
+def _alert_edge(opp: ArbOpportunity) -> float:
+    """Return the best available edge metric for an opportunity."""
+    return float(opp.profit_percentage or opp.ev_percentage or opp.middle_gap or 0.0)
+
+
+def _save_alert_state() -> None:
+    """Persist alert control state so mute/dedupe survive restarts."""
+    try:
+        directory = os.path.dirname(ALERT_STATE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        payload = {
+            "alert_state": dict(_alert_state),
+            "alert_dedupe": {fp: ts.isoformat() for fp, ts in _alert_dedupe.items()},
+            "alert_lifecycle": dict(_alert_lifecycle),
+            "alert_stats": dict(_alert_stats),
+            "saved_at": datetime.utcnow().isoformat(),
+        }
+        with open(ALERT_STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except Exception as exc:
+        logger.warning(f"Failed to save alert state: {exc}")
+
+
+def _load_alert_state() -> None:
+    """Load persisted alert control state if it exists."""
+    if not os.path.exists(ALERT_STATE_PATH):
+        return
+
+    try:
+        with open(ALERT_STATE_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        stored_state = payload.get("alert_state") or {}
+        if stored_state:
+            _alert_state.update({
+                "enabled": stored_state.get("enabled", _alert_state["enabled"]),
+                "disabled_at": stored_state.get("disabled_at"),
+                "disabled_by": stored_state.get("disabled_by"),
+            })
+
+        _alert_dedupe.clear()
+        for fp, ts in (payload.get("alert_dedupe") or {}).items():
+            try:
+                _alert_dedupe[fp] = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+
+        _alert_lifecycle.clear()
+        _alert_lifecycle.update(payload.get("alert_lifecycle") or {})
+
+        for key, value in (payload.get("alert_stats") or {}).items():
+            if key in _alert_stats:
+                _alert_stats[key] = int(value)
+
+        _cleanup_stale_dedupe()
+        logger.info(
+            "Loaded alert state: enabled=%s dedupe=%s lifecycle=%s",
+            _alert_state["enabled"],
+            len(_alert_dedupe),
+            len(_alert_lifecycle),
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to load alert state: {exc}")
+
+
+def _alert_fingerprint(opp: ArbOpportunity) -> str:
+    """Compute a stable fingerprint for deduplication."""
+    parts = [
+        opp.event_id,
+        opp.market,
+        opp.opportunity_type or "arb",
+    ]
+    for leg in sorted(opp.legs, key=lambda l: l.get("bookmaker", "")):
+        parts.append(leg.get("bookmaker", ""))
+        parts.append(leg.get("selection", ""))
+        # Round odds to 2 decimals so tiny fluctuations don't break dedupe
+        parts.append(f"{leg.get('odds_decimal', 0):.2f}")
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _prune_rate_limit_window() -> None:
+    """Remove send timestamps older than 60 seconds."""
+    cutoff = datetime.utcnow() - timedelta(seconds=60)
+    while _alert_send_times and _alert_send_times[0] < cutoff:
+        _alert_send_times.pop(0)
+
+
+def _should_suppress_alert(opp: ArbOpportunity) -> Optional[str]:
+    """
+    Check whether an alert should be suppressed.
+    Returns a reason string if suppressed, None if it should be sent.
+    """
+    # 1. Global mute
+    if not _alert_state["enabled"]:
+        _alert_stats["suppressed_muted"] += 1
+        return "alerts_disabled"
+
+    # 2. Quality gate
+    opp_type = opp.opportunity_type or "arb"
+    if opp_type == "arb":
+        profit = opp.profit_percentage or 0
+        if profit < MIN_ARB_PROFIT_PCT:
+            _alert_stats["suppressed_quality"] += 1
+            return f"arb_profit_{profit:.2f}_below_{MIN_ARB_PROFIT_PCT}"
+    elif opp_type == "positive_ev":
+        ev = opp.ev_percentage or 0
+        if ev < MIN_EV_PCT:
+            _alert_stats["suppressed_quality"] += 1
+            return f"ev_{ev:.2f}_below_{MIN_EV_PCT}"
+    elif opp_type == "middle":
+        gap = opp.middle_gap or 0
+        if gap < MIN_MIDDLE_GAP:
+            _alert_stats["suppressed_quality"] += 1
+            return f"middle_gap_{gap:.2f}_below_{MIN_MIDDLE_GAP}"
+
+    # 3. Dedupe/cooldown
+    fp = _alert_fingerprint(opp)
+    last_sent = _alert_dedupe.get(fp)
+    if last_sent:
+        elapsed = (datetime.utcnow() - last_sent).total_seconds()
+        if elapsed < ALERT_COOLDOWN_SECONDS:
+            _alert_stats["suppressed_dedupe"] += 1
+            return f"dedupe_cooldown_{int(elapsed)}s_of_{ALERT_COOLDOWN_SECONDS}s"
+
+    # 4. Rate limit
+    _prune_rate_limit_window()
+    if len(_alert_send_times) >= ALERT_RATE_LIMIT_PER_MINUTE:
+        _alert_stats["suppressed_rate_limit"] += 1
+        return f"rate_limit_{len(_alert_send_times)}_per_min"
+
+    return None
+
+
+def _record_alert_sent(opp: ArbOpportunity) -> None:
+    """Record that an alert was sent for lifecycle tracking."""
+    fp = _alert_fingerprint(opp)
+    now = datetime.utcnow()
+    _alert_dedupe[fp] = now
+    _alert_send_times.append(now)
+
+    if fp not in _alert_lifecycle:
+        _alert_lifecycle[fp] = {
+            "first_seen": now.isoformat(),
+            "last_seen": now.isoformat(),
+            "send_count": 0,
+            "suppressed_count": 0,
+            "best_edge": 0.0,
+            "event_id": opp.event_id,
+            "market": opp.market,
+            "type": opp.opportunity_type or "arb",
+        }
+    entry = _alert_lifecycle[fp]
+    entry["last_seen"] = now.isoformat()
+    entry["send_count"] += 1
+
+    # Track best edge seen
+    edge = _alert_edge(opp)
+    if edge > entry["best_edge"]:
+        entry["best_edge"] = edge
+
+    _save_alert_state()
+
+
+def _record_alert_suppressed(opp: ArbOpportunity) -> None:
+    """Record that an alert was suppressed."""
+    fp = _alert_fingerprint(opp)
+    now = datetime.utcnow()
+    if fp not in _alert_lifecycle:
+        _alert_lifecycle[fp] = {
+            "first_seen": now.isoformat(),
+            "last_seen": now.isoformat(),
+            "send_count": 0,
+            "suppressed_count": 0,
+            "best_edge": 0.0,
+            "event_id": opp.event_id,
+            "market": opp.market,
+            "type": opp.opportunity_type or "arb",
+        }
+    entry = _alert_lifecycle[fp]
+    entry["last_seen"] = now.isoformat()
+    entry["suppressed_count"] += 1
+    edge = _alert_edge(opp)
+    if edge > entry["best_edge"]:
+        entry["best_edge"] = edge
+
+    _save_alert_state()
+
+
+def _cleanup_stale_dedupe() -> None:
+    """Remove dedupe entries older than 2x the cooldown window."""
+    cutoff = datetime.utcnow() - timedelta(seconds=ALERT_COOLDOWN_SECONDS * 2)
+    stale = [fp for fp, ts in _alert_dedupe.items() if ts < cutoff]
+    for fp in stale:
+        del _alert_dedupe[fp]
+
+    # Also prune lifecycle entries older than 1 hour
+    lf_cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    stale_lf = [fp for fp, e in _alert_lifecycle.items() if e["last_seen"] < lf_cutoff]
+    for fp in stale_lf:
+        del _alert_lifecycle[fp]
+
+    if stale or stale_lf:
+        _save_alert_state()
 
 app = FastAPI(title="Slack Notifier", version="0.1.0")
 
@@ -317,11 +571,23 @@ async def send_arb_alert(opportunity: ArbOpportunity) -> SlackNotificationRespon
     else:
         alert.message = _format_arb_alert(alert)
 
-    # Store for bet command processing
+    # Store for bet command processing (always, even if suppressed — so bet commands still work)
     _pending_alerts[alert.alert_id] = alert
 
-    # Clean up old alerts (>30 min)
+    # Clean up old alerts (>30 min) and stale dedupe entries
     _cleanup_old_alerts()
+    _cleanup_stale_dedupe()
+
+    # ── Control plane: check whether to suppress this alert ──
+    _alert_stats["total_received"] += 1
+    suppress_reason = _should_suppress_alert(opportunity)
+    if suppress_reason:
+        _record_alert_suppressed(opportunity)
+        logger.info(f"Alert suppressed: {suppress_reason} | {opportunity.event_id}")
+        return SlackNotificationResponse(
+            delivered=False,
+            detail=f"Suppressed: {suppress_reason}",
+        )
 
     # Send to Slack
     notification = SlackNotification(
@@ -330,7 +596,11 @@ async def send_arb_alert(opportunity: ArbOpportunity) -> SlackNotificationRespon
         username="ArbDesk Bot",
     )
 
-    return notify(notification)
+    result = notify(notification)
+    if result.delivered:
+        _record_alert_sent(opportunity)
+        _alert_stats["total_sent"] += 1
+    return result
 
 
 def _cleanup_old_alerts() -> None:
@@ -342,6 +612,69 @@ def _cleanup_old_alerts() -> None:
     ]
     for aid in expired:
         del _pending_alerts[aid]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert Control Plane Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.get("/alerts/status")
+def alerts_status() -> Dict[str, Any]:
+    """Get current alert control plane state, stats, and lifecycle."""
+    return {
+        "enabled": _alert_state["enabled"],
+        "disabled_at": _alert_state["disabled_at"],
+        "disabled_by": _alert_state["disabled_by"],
+        "config": {
+            "cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+            "rate_limit_per_minute": ALERT_RATE_LIMIT_PER_MINUTE,
+            "min_arb_profit_pct": MIN_ARB_PROFIT_PCT,
+            "min_ev_pct": MIN_EV_PCT,
+            "min_middle_gap": MIN_MIDDLE_GAP,
+        },
+        "stats": dict(_alert_stats),
+        "dedupe_entries": len(_alert_dedupe),
+        "lifecycle_entries": len(_alert_lifecycle),
+        "pending_alerts": len(_pending_alerts),
+    }
+
+
+@app.post("/alerts/enable")
+def alerts_enable() -> Dict[str, Any]:
+    """Enable alert delivery."""
+    _alert_state["enabled"] = True
+    _alert_state["disabled_at"] = None
+    _alert_state["disabled_by"] = None
+    _save_alert_state()
+    logger.info("Alerts ENABLED via API")
+    return {"enabled": True, "message": "Alerts enabled"}
+
+
+@app.post("/alerts/disable")
+def alerts_disable() -> Dict[str, Any]:
+    """Disable alert delivery (mute). Operator/2FA messages still go through."""
+    _alert_state["enabled"] = False
+    _alert_state["disabled_at"] = datetime.utcnow().isoformat()
+    _alert_state["disabled_by"] = "api"
+    _save_alert_state()
+    logger.info("Alerts DISABLED via API")
+    return {"enabled": False, "message": "Alerts disabled (muted). Operator messages still delivered."}
+
+
+@app.get("/alerts/history")
+def alerts_history() -> Dict[str, Any]:
+    """Get recent alert lifecycle data."""
+    # Sort by last_seen descending
+    sorted_entries = sorted(
+        _alert_lifecycle.items(),
+        key=lambda x: x[1]["last_seen"],
+        reverse=True,
+    )[:50]
+    return {
+        "count": len(sorted_entries),
+        "entries": [{"fingerprint": fp, **data} for fp, data in sorted_entries],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,9 +842,9 @@ async def handle_slack_events(request: Request) -> Dict:
         logger.info(f"Visual login command result: {result}")
         return {"ok": True}
 
-    # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool|login [service]"
+    # Parse service control commands: "arb start|stop|restart|status|logs|heat|cool|login|mute|unmute|alerts [service]"
     arb_match = re.match(
-        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
+        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login|mute|unmute|alerts)(?:\s+(\S+))?",
         text,
         re.IGNORECASE,
     )
@@ -527,6 +860,8 @@ async def handle_slack_events(request: Request) -> Dict:
             result = await handle_cool_command(arg, user_id)
         elif action == "login":
             result = await handle_login_command(arg, user_id)
+        elif action in ("mute", "unmute", "alerts"):
+            result = await handle_alert_control_command(action, user_id)
         else:
             result = await handle_service_control(action, arg, user_id)
         logger.info(f"Command result: {result}")
@@ -903,6 +1238,61 @@ async def handle_cool_command(bookmaker: Optional[str], user_id: str) -> Dict:
         return {"ok": False, "error": str(e)}
 
 
+async def handle_alert_control_command(action: str, user_id: str) -> Dict:
+    """Handle alert control commands from Slack: mute, unmute, alerts."""
+    if action == "mute":
+        _alert_state["enabled"] = False
+        _alert_state["disabled_at"] = datetime.utcnow().isoformat()
+        _alert_state["disabled_by"] = f"slack:{user_id}"
+        _save_alert_state()
+        msg = "🔇 *Alerts MUTED*\nNo arb/EV/middle alerts will be sent until you run `arb unmute`."
+        logger.info(f"Alerts muted by Slack user {user_id}")
+        await _send_slack_response(msg, user_id)
+        return {"ok": True, "enabled": False}
+
+    elif action == "unmute":
+        _alert_state["enabled"] = True
+        _alert_state["disabled_at"] = None
+        _alert_state["disabled_by"] = None
+        _save_alert_state()
+        msg = "🔔 *Alerts UNMUTED*\nArb/EV/middle alerts are active again."
+        logger.info(f"Alerts unmuted by Slack user {user_id}")
+        await _send_slack_response(msg, user_id)
+        return {"ok": True, "enabled": True}
+
+    elif action == "alerts":
+        stats = _alert_stats
+        state = "🔔 ON" if _alert_state["enabled"] else "🔇 MUTED"
+        lines = [
+            f"📊 *Alert Control Status: {state}*",
+            "",
+            f"*Received:* {stats['total_received']}",
+            f"*Sent:* {stats['total_sent']}",
+            f"*Suppressed (muted):* {stats['suppressed_muted']}",
+            f"*Suppressed (dedupe):* {stats['suppressed_dedupe']}",
+            f"*Suppressed (quality):* {stats['suppressed_quality']}",
+            f"*Suppressed (rate limit):* {stats['suppressed_rate_limit']}",
+            "",
+            f"*Cooldown:* {ALERT_COOLDOWN_SECONDS}s",
+            f"*Rate limit:* {ALERT_RATE_LIMIT_PER_MINUTE}/min",
+            f"*Min arb profit:* {MIN_ARB_PROFIT_PCT}%",
+            f"*Min EV:* {MIN_EV_PCT}%",
+            f"*Min middle gap:* {MIN_MIDDLE_GAP}",
+            "",
+            f"*Dedupe entries:* {len(_alert_dedupe)}",
+            f"*Lifecycle entries:* {len(_alert_lifecycle)}",
+            f"*Pending alerts:* {len(_pending_alerts)}",
+        ]
+        if _alert_state.get("disabled_at"):
+            lines.append(f"*Muted at:* {_alert_state['disabled_at']}")
+            lines.append(f"*Muted by:* {_alert_state['disabled_by']}")
+        msg = "\n".join(lines)
+        await _send_slack_response(msg, user_id)
+        return {"ok": True, "stats": dict(stats)}
+
+    return {"ok": False, "error": f"Unknown alert action: {action}"}
+
+
 async def _send_slack_response(message: str, user_id: str) -> None:
     """Send a response message to Slack."""
     if SLACK_BOT_TOKEN:
@@ -1206,7 +1596,7 @@ async def _process_message_async(text: str, user_id: str, channel: str) -> None:
 
     # Parse service control commands
     arb_match = re.match(
-        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login)(?:\s+(\S+))?",
+        r"arb\s+(start|stop|restart|status|scrape|logs|heat|cool|login|mute|unmute|alerts)(?:\s+(\S+))?",
         text,
         re.IGNORECASE,
     )
@@ -1222,6 +1612,8 @@ async def _process_message_async(text: str, user_id: str, channel: str) -> None:
             result = await handle_cool_command(arg, user_id)
         elif action == "login":
             result = await handle_login_command(arg, user_id)
+        elif action in ("mute", "unmute", "alerts"):
+            result = await handle_alert_control_command(action, user_id)
         else:
             result = await handle_service_control(action, arg, user_id)
         logger.info(f"Socket Mode command result: {result}")
@@ -1232,6 +1624,9 @@ async def _process_message_async(text: str, user_id: str, channel: str) -> None:
         await _send_slack_response(
             "❓ Unknown command. Available commands:\n"
             "• `arb status` - Service status\n"
+            "• `arb mute` - Mute arb alerts\n"
+            "• `arb unmute` - Unmute arb alerts\n"
+            "• `arb alerts` - Alert stats/status\n"
             "• `arb login [bookmaker]` - Login to bookmakers\n"
             "• `arb login visual <bookmaker>` - Open browser window for manual login\n"
             "• `arb scrape` - Trigger scrape\n"
@@ -1288,6 +1683,7 @@ def _start_socket_mode() -> None:
 @app.on_event("startup")
 def startup_socket_mode():
     """Start Socket Mode listener when FastAPI starts."""
+    _load_alert_state()
     thread = threading.Thread(target=_start_socket_mode, daemon=True)
     thread.start()
     logger.info("Socket Mode thread launched")
