@@ -38,6 +38,35 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _prediction_market_state_dir() -> str:
+    return os.getenv("PREDICTION_MARKET_STATE_DIR", os.path.join("data", "prediction_markets"))
+
+
+def _load_json_state(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to load prediction-market state from %s: %s", path, exc)
+        return {}
+
+
+def _save_json_state(path: str, payload: Dict[str, Any]) -> None:
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.warning("Failed to save prediction-market state to %s: %s", path, exc)
+
+
 class PolymarketAdapter:
     """
     Polymarket API adapter for prediction market odds.
@@ -71,6 +100,59 @@ class PolymarketAdapter:
             self._next_offset = max(0, int(os.getenv("POLYMARKET_START_OFFSET", "0")))
         except Exception:
             self._next_offset = 0
+        self._state_path = self.config.get("state_path") or os.path.join(
+            _prediction_market_state_dir(),
+            "polymarket_adapter_state.json",
+        )
+        self._last_fetch_at: Optional[str] = None
+        self._last_fetch_count: int = 0
+        self._last_error: Optional[str] = None
+        self._load_state()
+
+    def _load_state(self) -> None:
+        payload = _load_json_state(self._state_path)
+        try:
+            self._next_offset = max(0, int(payload.get("next_offset", self._next_offset)))
+        except Exception:
+            pass
+        self._last_fetch_at = payload.get("last_fetch_at")
+        try:
+            self._last_fetch_count = max(0, int(payload.get("last_fetch_count", 0) or 0))
+        except Exception:
+            self._last_fetch_count = 0
+        self._last_error = payload.get("last_error")
+
+    def _save_state(self) -> None:
+        _save_json_state(
+            self._state_path,
+            {
+                "adapter": "polymarket",
+                "next_offset": self._next_offset,
+                "last_fetch_at": self._last_fetch_at,
+                "last_fetch_count": self._last_fetch_count,
+                "last_error": self._last_error,
+                "saved_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    def _record_fetch_result(self, count: int, error: Optional[str] = None) -> None:
+        self._last_fetch_at = datetime.utcnow().isoformat()
+        self._last_fetch_count = max(0, int(count))
+        self._last_error = str(error)[:200] if error else None
+        self._save_state()
+
+    def runtime_state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": "polymarket",
+            "state_path": self._state_path,
+            "rotate_pagination": self._rotate_pagination,
+            "page_limit": self.page_limit,
+            "max_pages": self.max_pages,
+            "next_offset": self._next_offset,
+            "last_fetch_at": self._last_fetch_at,
+            "last_fetch_count": self._last_fetch_count,
+            "last_error": self._last_error,
+        }
 
     async def fetch_markets(self, sport: Optional[str] = None) -> List[MarketOdds]:
         """Fetch all active markets, optionally filtered by sport."""
@@ -115,8 +197,10 @@ class PolymarketAdapter:
             # Persist our position for the next poll so we cover more of the catalog over time.
             if self._rotate_pagination:
                 self._next_offset = 0 if hit_end else offset
+            self._record_fetch_result(len(odds_list))
 
         except Exception as e:
+            self._record_fetch_result(len(odds_list), str(e))
             logger.error(f"[Polymarket] Failed to fetch markets: {e}")
 
         logger.info(f"[Polymarket] Fetched {len(odds_list)} market odds")
@@ -251,6 +335,10 @@ class KalshiAdapter:
         self.use_demo = self.config.get("use_demo", False)
         self.base_url = self.DEMO_URL if self.use_demo else self.BASE_URL
         self.client = httpx.AsyncClient(timeout=30)
+        self._state_path = self.config.get("state_path") or os.path.join(
+            _prediction_market_state_dir(),
+            "kalshi_adapter_state.json",
+        )
 
         # For optional authenticated calls, Kalshi signatures need the path prefix
         # (e.g. "/trade-api/v2"). This is safe even when we only use public reads.
@@ -316,6 +404,62 @@ class KalshiAdapter:
                 logger.warning("[Kalshi] KALSHI_PRIVATE_KEY_PATH not set")
             elif not os.path.exists(private_key_path):
                 logger.warning(f"[Kalshi] Key file not found: {private_key_path}")
+        self._last_fetch_at: Optional[str] = None
+        self._last_fetch_count: int = 0
+        self._last_error: Optional[str] = None
+        self._load_state()
+
+    def _load_state(self) -> None:
+        payload = _load_json_state(self._state_path)
+        global_cursor = payload.get("global_markets_cursor")
+        self._global_markets_cursor = str(global_cursor) if global_cursor else None
+        nonsports_cursor = payload.get("nonsports_markets_cursor")
+        self._nonsports_markets_cursor = str(nonsports_cursor) if nonsports_cursor else None
+        try:
+            self._series_rr_idx = max(0, int(payload.get("series_rr_idx", self._series_rr_idx) or 0))
+        except Exception:
+            pass
+        self._last_fetch_at = payload.get("last_fetch_at")
+        try:
+            self._last_fetch_count = max(0, int(payload.get("last_fetch_count", 0) or 0))
+        except Exception:
+            self._last_fetch_count = 0
+        self._last_error = payload.get("last_error")
+
+    def _save_state(self) -> None:
+        _save_json_state(
+            self._state_path,
+            {
+                "adapter": "kalshi",
+                "global_markets_cursor": self._global_markets_cursor,
+                "nonsports_markets_cursor": self._nonsports_markets_cursor,
+                "series_rr_idx": self._series_rr_idx,
+                "last_fetch_at": self._last_fetch_at,
+                "last_fetch_count": self._last_fetch_count,
+                "last_error": self._last_error,
+                "saved_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    def _record_fetch_result(self, count: int, error: Optional[str] = None) -> None:
+        self._last_fetch_at = datetime.utcnow().isoformat()
+        self._last_fetch_count = max(0, int(count))
+        self._last_error = str(error)[:200] if error else None
+        self._save_state()
+
+    def runtime_state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "name": "kalshi",
+            "state_path": self._state_path,
+            "rotate_global_cursor": self._rotate_global_cursor,
+            "rotate_nonsports_cursor": self._rotate_nonsports_cursor,
+            "global_markets_cursor": self._global_markets_cursor,
+            "nonsports_markets_cursor": self._nonsports_markets_cursor,
+            "series_rr_idx": self._series_rr_idx,
+            "last_fetch_at": self._last_fetch_at,
+            "last_fetch_count": self._last_fetch_count,
+            "last_error": self._last_error,
+        }
 
     # ── HTTP Helpers (rate limit + 429 handling) ───────────────────────────
 
@@ -489,11 +633,13 @@ class KalshiAdapter:
             elif mode == "events":
                 added = await _merge_extra(await self._fetch_event_based_markets(), "event-based")
                 if added:
+                    self._record_fetch_result(len(odds_list))
                     return odds_list
             else:
                 # default: scan
                 added = await _merge_extra(await self._fetch_non_sports_markets_scan(), "non-sports")
                 if added:
+                    self._record_fetch_result(len(odds_list))
                     return odds_list
         except Exception as e:
             logger.warning(f"[Kalshi] Non-sports market fetch failed (non-fatal): {e}")
@@ -503,18 +649,21 @@ class KalshiAdapter:
             try:
                 added = await _merge_extra(await self._fetch_event_based_markets(), "event-based")
                 if added:
+                    self._record_fetch_result(len(odds_list))
                     return odds_list
             except Exception as e:
                 logger.warning(f"[Kalshi] Event-based fallback failed (non-fatal): {e}")
 
         if odds_list:
             logger.info(f"[Kalshi] Fetched {len(odds_list)} market odds (global open, mve_filter=exclude)")
+            self._record_fetch_result(len(odds_list))
             return odds_list
 
         # Fallback: poll a rotating slice of discovered series tickers (best-effort)
         series_tickers = await self._get_series_tickers_for_poll()
         if not series_tickers:
             logger.warning("[Kalshi] No series tickers available for polling")
+            self._record_fetch_result(0)
             return []
 
         # Fetch markets for selected series concurrently (bounded)
@@ -534,6 +683,7 @@ class KalshiAdapter:
             odds_list.extend(res)
 
         logger.info(f"[Kalshi] Fetched {len(odds_list)} market odds (series fallback)")
+        self._record_fetch_result(len(odds_list))
         return odds_list
 
     async def _fetch_open_markets_global(self) -> List[MarketOdds]:
@@ -590,6 +740,7 @@ class KalshiAdapter:
         # Persist cursor across polls so we cover more than the first pages over time.
         if self._rotate_global_cursor:
             self._global_markets_cursor = None if hit_end else cursor
+            self._save_state()
 
         return odds_list
 
@@ -664,6 +815,7 @@ class KalshiAdapter:
         # Persist cursor across refreshes so we don't keep scanning the same first pages.
         if self._rotate_nonsports_cursor:
             self._nonsports_markets_cursor = None if hit_end else cursor
+            self._save_state()
 
         deduped = self._dedupe_odds_keep_sides(odds_list)
 
@@ -847,6 +999,7 @@ class KalshiAdapter:
         selected = (all_tickers[start:end] if end <= len(all_tickers)
                     else all_tickers[start:] + all_tickers[: (end % len(all_tickers))])
         self._series_rr_idx = (self._series_rr_idx + max_series) % len(all_tickers)
+        self._save_state()
         return selected
 
     async def _get_all_series_tickers_cached(self) -> List[str]:

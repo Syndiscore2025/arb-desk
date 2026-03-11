@@ -16,6 +16,7 @@ from services.market_feed.app.adapters.prediction_markets import (
 from services.market_feed.app.prediction_market_diagnostics import (
     categorize_prediction_market_titles,
 )
+from services.market_feed.app.prediction_market_runtime import PredictionMarketRuntimeStore
 
 
 class _StubResponse:
@@ -116,6 +117,39 @@ class TestPolymarketLogic:
         assert len(second) == 1
         assert first_offset == 2
         assert second_offset == 0
+
+    def test_fetch_markets_persists_offset_between_instances(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PREDICTION_MARKET_STATE_DIR", str(tmp_path))
+
+        adapter = PolymarketAdapter()
+        adapter.page_limit = 2
+        adapter.max_pages = 1
+
+        async def fake_get(_url, params=None, **_kwargs):
+            assert params.get("offset") == 0
+            return _StubResponse({"markets": [{"id": "m1"}, {"id": "m2"}]})
+
+        monkeypatch.setattr(adapter.client, "get", fake_get)
+        monkeypatch.setattr(
+            adapter,
+            "_parse_market",
+            lambda market: [_make_prediction_odds(f"poly-{market['id']}", "polymarket")],
+        )
+
+        async def exercise():
+            await adapter.fetch_markets()
+            await adapter.close()
+
+        asyncio.run(exercise())
+
+        reloaded = PolymarketAdapter()
+        try:
+            assert reloaded._next_offset == 2
+            snapshot = reloaded.runtime_state_snapshot()
+            assert snapshot["next_offset"] == 2
+            assert snapshot["last_fetch_count"] == 2
+        finally:
+            asyncio.run(reloaded.close())
 
 
 class TestKalshiLogic:
@@ -276,6 +310,49 @@ class TestKalshiLogic:
         assert len(second) == 1
         assert first_cursor == "next-w"
         assert second_cursor is None
+
+    def test_kalshi_persists_cursors_between_instances(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PREDICTION_MARKET_STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("KALSHI_GLOBAL_MARKETS_PAGE_LIMIT", "2")
+        monkeypatch.setenv("KALSHI_GLOBAL_MAX_PAGES", "1")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_CACHE_TTL_SECONDS", "0")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_PAGE_LIMIT", "2")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_MAX_PAGES", "1")
+        monkeypatch.setenv("KALSHI_NON_SPORTS_TARGET_ODDS", "10")
+
+        adapter = KalshiAdapter()
+
+        async def fake_get_json(path, params=None):
+            assert path == "/markets"
+            params = params or {}
+            if params.get("status") == "open":
+                return {"markets": [{"ticker": "A"}, {"ticker": "B"}], "cursor": "next-global"}
+            return {"markets": [{"ticker": "W1"}, {"ticker": "W2"}], "cursor": "next-nonsports"}
+
+        monkeypatch.setattr(adapter, "_get_json", fake_get_json)
+        monkeypatch.setattr(adapter, "_is_non_sports_market_candidate", lambda _market: True)
+        monkeypatch.setattr(
+            adapter,
+            "_parse_market",
+            lambda market: [_make_prediction_odds(f"kalshi-{market['ticker']}", "kalshi")],
+        )
+
+        async def exercise():
+            await adapter._fetch_open_markets_global()
+            await adapter._fetch_non_sports_markets_scan()
+            await adapter.close()
+
+        asyncio.run(exercise())
+
+        reloaded = KalshiAdapter()
+        try:
+            snapshot = reloaded.runtime_state_snapshot()
+            assert reloaded._global_markets_cursor == "next-global"
+            assert reloaded._nonsports_markets_cursor == "next-nonsports"
+            assert snapshot["global_markets_cursor"] == "next-global"
+            assert snapshot["nonsports_markets_cursor"] == "next-nonsports"
+        finally:
+            asyncio.run(reloaded.close())
 
     def test_cents_to_decimal_odds(self):
         """Convert Kalshi cents (0-100) to decimal odds."""
@@ -438,13 +515,52 @@ class TestPredictionMarketDiagnostics:
         assert counts["other"] == 1
 
 
+class TestPredictionMarketRuntimeStore:
+    def test_runtime_store_persists_recent_history(self, tmp_path):
+        state_path = tmp_path / "runtime_state.json"
+        store = PredictionMarketRuntimeStore(
+            state_path=str(state_path),
+            history_limit=2,
+            payload_sample_size=1,
+        )
+
+        entry = store.record_cycle(
+            market_name="prediction_markets",
+            status="ok",
+            source_counts={"polymarket": 2, "kalshi": 1},
+            batch_count=3,
+            pushed=True,
+            duration_seconds=1.234,
+            adapter_states={"polymarket": {"next_offset": 2}},
+            matching={"matched_pairs": 1, "best_candidate_score": 0.91},
+            payload=[{"event_id": "pred-1"}, {"event_id": "pred-2"}],
+        )
+
+        snapshot = store.snapshot_status()
+        assert snapshot["history_size"] == 1
+        assert snapshot["last_status"] == "ok"
+        assert entry["payload_count"] == 2
+        assert entry["payload_truncated"] is True
+        assert len(entry["payload_sample"]) == 1
+
+        reloaded = PredictionMarketRuntimeStore(
+            state_path=str(state_path),
+            history_limit=2,
+            payload_sample_size=1,
+        )
+        reloaded_entry = reloaded.history(limit=1)[0]
+        assert reloaded_entry["payload_sha256"] == entry["payload_sha256"]
+        assert reloaded_entry["source_counts"]["polymarket"] == 2
+
+
 class TestPredictionMarketPollingSource:
     def test_main_source_contains_combined_prediction_market_poll_loop(self):
         source = Path("services/market_feed/app/main.py").read_text(encoding="utf-8")
 
         assert "async def _prediction_market_combined_poll_loop" in source
         assert "combined_odds, meta = unifier.unify(poly_odds, kalshi_odds)" in source
-        assert 'json=[o.model_dump(mode="json") for o in combined_odds]' in source
+        assert 'payload = [o.model_dump(mode="json") for o in combined_odds] if combined_odds else []' in source
+        assert 'json=payload' in source
 
     def test_main_source_schedules_combined_poller_when_both_prediction_markets_enabled(self):
         source = Path("services/market_feed/app/main.py").read_text(encoding="utf-8")
@@ -452,6 +568,13 @@ class TestPredictionMarketPollingSource:
         assert "if poly_enabled and kalshi_enabled:" in source
         assert "_prediction_market_combined_poll_loop(poly_adapter, kalshi_adapter)" in source
         assert '_poller_tasks["prediction_markets"] = task' in source
+
+    def test_main_source_contains_prediction_market_status_and_history_endpoints(self):
+        source = Path("services/market_feed/app/main.py").read_text(encoding="utf-8")
+
+        assert '@app.get("/prediction-markets/status")' in source
+        assert '@app.get("/prediction-markets/history")' in source
+        assert "_prediction_market_runtime_store.record_cycle(" in source
 
     def test_weather_keyword_matching_avoids_name_substring_false_positive(self):
         counts = categorize_prediction_market_titles([

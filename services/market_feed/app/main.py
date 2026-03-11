@@ -14,7 +14,7 @@ import random
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -44,6 +44,7 @@ from .adapters.prediction_markets import (
     PredictionMarketEventUnifier,
 )
 from .prediction_market_diagnostics import categorize_prediction_market_titles
+from .prediction_market_runtime import PredictionMarketRuntimeStore
 
 # Configure logging
 logger = setup_logging("market_feed")
@@ -75,6 +76,10 @@ _disabled_pollers: Dict[str, str] = {}
 
 # Track prediction-market adapter instances so we can close HTTP clients on shutdown
 _prediction_market_adapters: List[object] = []
+_prediction_market_runtime_store = PredictionMarketRuntimeStore(
+    history_limit=int(os.getenv("PREDICTION_MARKET_HISTORY_LIMIT", "25")),
+    payload_sample_size=int(os.getenv("PREDICTION_MARKET_PAYLOAD_SAMPLE_SIZE", "25")),
+)
 
 # Randomized polling bounds (seconds)
 POLL_MIN_INTERVAL = int(os.getenv("POLL_MIN_INTERVAL", "45"))
@@ -140,6 +145,93 @@ def _load_credentials() -> Dict[str, BookmakerCredentials]:
     except Exception as e:
         logger.error(f"Error loading credentials: {e}")
         return {}
+
+
+def _prediction_market_adapter_state(adapter: object) -> Optional[Dict[str, Any]]:
+    snapshotter = getattr(adapter, "runtime_state_snapshot", None)
+    if not callable(snapshotter):
+        return None
+    try:
+        snapshot = snapshotter()
+        return snapshot if isinstance(snapshot, dict) else None
+    except Exception as exc:
+        return {"name": adapter.__class__.__name__.lower(), "snapshot_error": str(exc)[:200]}
+
+
+def _prediction_market_adapter_states() -> Dict[str, Dict[str, Any]]:
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for adapter in list(_prediction_market_adapters):
+        snapshot = _prediction_market_adapter_state(adapter)
+        if not snapshot:
+            continue
+        name = str(snapshot.get("name") or adapter.__class__.__name__.lower())
+        snapshots[name] = snapshot
+    return snapshots
+
+
+def _record_prediction_market_cycle(
+    market_name: str,
+    *,
+    status: str,
+    source_counts: Dict[str, int],
+    batch_count: int,
+    pushed: bool,
+    duration_seconds: float,
+    adapter_states: Optional[Dict[str, Dict[str, Any]]] = None,
+    matching: Optional[Dict[str, Any]] = None,
+    fetch_errors: Optional[List[str]] = None,
+    error: Optional[str] = None,
+    payload: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    stats = _poller_stats.setdefault(market_name, {})
+    stats.update(
+        {
+            "last_cycle_status": status,
+            "last_batch_count": int(batch_count),
+            "last_source_counts": dict(source_counts),
+            "last_push_at": datetime.utcnow().isoformat() if pushed else stats.get("last_push_at"),
+            "last_duration_seconds": round(float(duration_seconds), 3),
+            "last_fetch_errors": list(fetch_errors or []),
+            "last_matching": dict(matching or {}),
+            "last_error": str(error)[:200] if error else stats.get("last_error"),
+        }
+    )
+    _prediction_market_runtime_store.record_cycle(
+        market_name=market_name,
+        status=status,
+        source_counts=source_counts,
+        batch_count=batch_count,
+        pushed=pushed,
+        duration_seconds=duration_seconds,
+        adapter_states=adapter_states,
+        matching=matching,
+        fetch_errors=fetch_errors,
+        error=error,
+        payload=payload,
+    )
+
+
+def _prediction_market_enabled_config() -> Dict[str, bool]:
+    poly_enabled = os.getenv("POLYMARKET_ENABLED", "false").lower() == "true"
+    kalshi_enabled = os.getenv("KALSHI_ENABLED", "false").lower() == "true"
+    return {
+        "polymarket": poly_enabled,
+        "kalshi": kalshi_enabled,
+        "combined": poly_enabled and kalshi_enabled,
+    }
+
+
+def _prediction_market_pollers_status() -> Dict[str, Dict[str, Any]]:
+    pollers: Dict[str, Dict[str, Any]] = {}
+    for name in ("polymarket", "kalshi", "prediction_markets"):
+        if name not in _poller_tasks and name not in _poller_stats:
+            continue
+        task = _poller_tasks.get(name)
+        pollers[name] = {
+            "running": bool(task and not task.done()),
+            **_poller_stats.get(name, {}),
+        }
+    return pollers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,25 +374,39 @@ async def _prediction_market_poll_loop(market_name: str, adapter) -> None:
 
     while True:
         poll_start = datetime.utcnow()
+        cycle_started_at = time.monotonic()
         _poller_stats[market_name]["poll_count"] += 1
         _poller_stats[market_name]["last_poll_at"] = poll_start.isoformat()
 
         try:
             odds = await adapter.fetch_markets()
+            payload = [o.model_dump(mode="json") for o in odds] if odds else []
+            pushed = False
 
-            if odds:
+            if payload:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     resp = await client.post(
                         f"{ODDS_INGEST_URL}/process",
-                        json=[o.model_dump(mode="json") for o in odds],
+                        json=payload,
                     )
                     resp.raise_for_status()
+                pushed = True
                 logger.info(f"[{market_name}] Fetched {len(odds)} odds → pushed to pipeline")
             else:
                 logger.info(f"[{market_name}] No odds available this cycle")
 
             _poller_stats[market_name]["success_count"] += 1
             consecutive_errors = 0
+            _record_prediction_market_cycle(
+                market_name,
+                status="ok",
+                source_counts={market_name: len(odds)},
+                batch_count=len(odds),
+                pushed=pushed,
+                duration_seconds=time.monotonic() - cycle_started_at,
+                adapter_states={market_name: _prediction_market_adapter_state(adapter) or {}},
+                payload=payload,
+            )
 
         except asyncio.CancelledError:
             logger.info(f"[{market_name}] Poller cancelled")
@@ -313,6 +419,16 @@ async def _prediction_market_poll_loop(market_name: str, adapter) -> None:
             consecutive_errors += 1
             _poller_stats[market_name]["error_count"] += 1
             _poller_stats[market_name]["last_error"] = str(exc)[:200]
+            _record_prediction_market_cycle(
+                market_name,
+                status="error",
+                source_counts={},
+                batch_count=0,
+                pushed=False,
+                duration_seconds=time.monotonic() - cycle_started_at,
+                adapter_states={market_name: _prediction_market_adapter_state(adapter) or {}},
+                error=str(exc),
+            )
             logger.error(f"[{market_name}] Poll error ({consecutive_errors}): {exc}")
 
         # Determine next sleep
@@ -365,6 +481,7 @@ async def _prediction_market_combined_poll_loop(poly_adapter: PolymarketAdapter,
 
     while True:
         poll_start = datetime.utcnow()
+        cycle_started_at = time.monotonic()
         _poller_stats[market_name]["poll_count"] += 1
         _poller_stats[market_name]["last_poll_at"] = poll_start.isoformat()
 
@@ -377,16 +494,20 @@ async def _prediction_market_combined_poll_loop(poly_adapter: PolymarketAdapter,
 
             poly_odds: List[MarketOdds] = []
             kalshi_odds: List[MarketOdds] = []
+            fetch_errors: List[str] = []
             if isinstance(poly_res, Exception):
                 logger.error(f"[{market_name}] Polymarket fetch error: {poly_res}")
+                fetch_errors.append(f"polymarket: {poly_res}")
             else:
                 poly_odds = poly_res or []
 
             if isinstance(kalshi_res, Exception):
                 logger.error(f"[{market_name}] Kalshi fetch error: {kalshi_res}")
+                fetch_errors.append(f"kalshi: {kalshi_res}")
             else:
                 kalshi_odds = kalshi_res or []
 
+            meta: Dict[str, Any] = {}
             if poly_odds and kalshi_odds:
                 combined_odds, meta = unifier.unify(poly_odds, kalshi_odds)
                 logger.info(
@@ -407,19 +528,40 @@ async def _prediction_market_combined_poll_loop(poly_adapter: PolymarketAdapter,
                     len(combined_odds),
                 )
 
+            payload = [o.model_dump(mode="json") for o in combined_odds] if combined_odds else []
+            pushed = False
             if combined_odds:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     resp = await client.post(
                         f"{ODDS_INGEST_URL}/process",
-                        json=[o.model_dump(mode="json") for o in combined_odds],
+                        json=payload,
                     )
                     resp.raise_for_status()
+                pushed = True
                 logger.info(f"[{market_name}] Pushed {len(combined_odds)} odds → pipeline")
             else:
                 logger.info(f"[{market_name}] No odds available this cycle")
 
             _poller_stats[market_name]["success_count"] += 1
             consecutive_errors = 0
+            _record_prediction_market_cycle(
+                market_name,
+                status="partial_error" if fetch_errors else "ok",
+                source_counts={"polymarket": len(poly_odds), "kalshi": len(kalshi_odds)},
+                batch_count=len(combined_odds),
+                pushed=pushed,
+                duration_seconds=time.monotonic() - cycle_started_at,
+                adapter_states={
+                    "polymarket": _prediction_market_adapter_state(poly_adapter) or {},
+                    "kalshi": _prediction_market_adapter_state(kalshi_adapter) or {},
+                },
+                matching={
+                    "matched_pairs": meta.get("matched_pairs"),
+                    "best_candidate_score": meta.get("best_candidate_score"),
+                },
+                fetch_errors=fetch_errors,
+                payload=payload,
+            )
 
         except asyncio.CancelledError:
             logger.info(f"[{market_name}] Poller cancelled")
@@ -436,6 +578,19 @@ async def _prediction_market_combined_poll_loop(poly_adapter: PolymarketAdapter,
             consecutive_errors += 1
             _poller_stats[market_name]["error_count"] += 1
             _poller_stats[market_name]["last_error"] = str(exc)[:200]
+            _record_prediction_market_cycle(
+                market_name,
+                status="error",
+                source_counts={},
+                batch_count=0,
+                pushed=False,
+                duration_seconds=time.monotonic() - cycle_started_at,
+                adapter_states={
+                    "polymarket": _prediction_market_adapter_state(poly_adapter) or {},
+                    "kalshi": _prediction_market_adapter_state(kalshi_adapter) or {},
+                },
+                error=str(exc),
+            )
             logger.error(f"[{market_name}] Poll error ({consecutive_errors}): {exc}")
 
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -697,6 +852,27 @@ def polling_status() -> Dict:
         "active_pollers": sum(1 for t in _poller_tasks.values() if not t.done()),
         "total_pollers": len(_poller_tasks),
         "pollers": pollers,
+        "prediction_market_runtime": _prediction_market_runtime_store.snapshot_status(),
+    }
+
+
+@app.get("/prediction-markets/status")
+def prediction_market_status() -> Dict[str, Any]:
+    return {
+        "enabled": _prediction_market_enabled_config(),
+        "pollers": _prediction_market_pollers_status(),
+        "adapters": _prediction_market_adapter_states(),
+        "runtime": _prediction_market_runtime_store.snapshot_status(),
+    }
+
+
+@app.get("/prediction-markets/history")
+def prediction_market_history(limit: int = 10) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 100))
+    return {
+        "limit": limit,
+        "available": _prediction_market_runtime_store.snapshot_status()["history_size"],
+        "history": _prediction_market_runtime_store.history(limit=limit),
     }
 
 
